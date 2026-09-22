@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::str;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
@@ -76,6 +77,7 @@ use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
+use lance_index::vector::pca::PcaParams;
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
@@ -4381,6 +4383,7 @@ struct IndexProgressEvent {
     completed: Option<u64>,
     total: Option<u64>,
     unit: String,
+    elapsed_seconds: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -4389,6 +4392,7 @@ struct ActiveIndexProgressStage {
     completed: Option<u64>,
     total: Option<u64>,
     unit: String,
+    started_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -4437,6 +4441,7 @@ impl IndexBuildProgress for PyIndexBuildProgress {
                 completed: Some(0),
                 total,
                 unit: unit.to_string(),
+                started_at: Some(Instant::now()),
             };
         }
 
@@ -4446,6 +4451,7 @@ impl IndexBuildProgress for PyIndexBuildProgress {
             completed: Some(0),
             total,
             unit: unit.to_string(),
+            elapsed_seconds: None,
         })
     }
 
@@ -4462,6 +4468,7 @@ impl IndexBuildProgress for PyIndexBuildProgress {
                 completed: Some(completed),
                 total: active_stage.total,
                 unit: active_stage.unit.clone(),
+                elapsed_seconds: None,
             }
         };
 
@@ -4474,6 +4481,10 @@ impl IndexBuildProgress for PyIndexBuildProgress {
             let completed = active_stage.completed.or(active_stage.total);
             let total = active_stage.total;
             let unit = active_stage.unit.clone();
+            let elapsed_seconds = active_stage
+                .started_at
+                .as_ref()
+                .map(|started_at| started_at.elapsed().as_secs_f64());
             *active_stage = ActiveIndexProgressStage::default();
             IndexProgressEvent {
                 event: IndexProgressEventType::Complete,
@@ -4481,6 +4492,7 @@ impl IndexBuildProgress for PyIndexBuildProgress {
                 completed,
                 total,
                 unit,
+                elapsed_seconds,
             }
         };
 
@@ -4541,6 +4553,7 @@ impl IndexProgressDispatcher {
                     event.completed,
                     event.total,
                     event.unit,
+                    event.elapsed_seconds,
                 ),
             )?;
             self.callback.call1(py, (progress,))?;
@@ -5023,6 +5036,7 @@ fn prepare_vector_index_params(
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
     let mut rq_params = RQBuildParams::default();
+    let mut pca_params = None;
     let mut index_file_version = IndexFileVersion::V3;
     let mut skip_transpose = false;
 
@@ -5177,6 +5191,49 @@ fn prepare_vector_index_params(
             rq_params.rotation = Some(meta);
         };
 
+        let pca_option_keys = [
+            "pca_random_rotation",
+            "pca_whitening",
+            "pca_epsilon",
+            "pca_sample_size",
+            "pca_max_training_memory_bytes",
+            "pca_sampling_seed",
+            "pca_rotation_seed",
+        ];
+        if let Some(dimension) = kwargs.get_item("pca_dimension")? {
+            let mut parsed = PcaParams::new(dimension.extract()?);
+            if let Some(value) = kwargs.get_item("pca_random_rotation")? {
+                parsed = parsed.with_random_rotation(value.extract()?);
+            }
+            if let Some(value) = kwargs.get_item("pca_whitening")? {
+                parsed = parsed.with_whitening(value.extract()?);
+            }
+            if let Some(value) = kwargs.get_item("pca_epsilon")? {
+                parsed = parsed.with_epsilon(value.extract()?);
+            }
+            if let Some(value) = kwargs.get_item("pca_sample_size")? {
+                parsed = parsed.with_sample_size(value.extract()?);
+            }
+            if let Some(value) = kwargs.get_item("pca_max_training_memory_bytes")? {
+                parsed = parsed.with_max_training_memory_bytes(value.extract()?);
+            }
+            if let Some(value) = kwargs.get_item("pca_sampling_seed")? {
+                parsed = parsed.with_sampling_seed(value.extract()?);
+            }
+            if let Some(value) = kwargs.get_item("pca_rotation_seed")? {
+                parsed = parsed.with_rotation_seed(value.extract()?);
+            }
+            pca_params = Some(parsed);
+        } else {
+            for key in pca_option_keys {
+                if kwargs.get_item(key)?.is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "{key} requires pca_dimension"
+                    )));
+                }
+            }
+        }
+
         if let Some(version) = kwargs.get_item("index_file_version")? {
             let version: String = version.extract()?;
             index_file_version = IndexFileVersion::try_from(&version)
@@ -5189,41 +5246,35 @@ fn prepare_vector_index_params(
     }
 
     let mut params = match index_type {
-        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::with_ivf_flat_params(
-            m_type, ivf_params,
-        ))),
+        "IVF_FLAT" => Ok(VectorIndexParams::with_ivf_flat_params(m_type, ivf_params)),
 
-        "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
+        "IVF_PQ" => Ok(VectorIndexParams::with_ivf_pq_params(
             m_type, ivf_params, pq_params,
-        ))),
+        )),
 
-        "IVF_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_sq_params(
+        "IVF_SQ" => Ok(VectorIndexParams::with_ivf_sq_params(
             m_type, ivf_params, sq_params,
-        ))),
+        )),
 
-        "IVF_RQ" => Ok(Box::new(VectorIndexParams::with_ivf_rq_params(
+        "IVF_RQ" => Ok(VectorIndexParams::with_ivf_rq_params(
             m_type, ivf_params, rq_params,
-        ))),
+        )),
 
-        "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
-            m_type,
-            ivf_params,
-            hnsw_params,
-        ))),
+        "IVF_HNSW_FLAT" => Ok(VectorIndexParams::ivf_hnsw(m_type, ivf_params, hnsw_params)),
 
-        "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
+        "IVF_HNSW_PQ" => Ok(VectorIndexParams::with_ivf_hnsw_pq_params(
             m_type,
             ivf_params,
             hnsw_params,
             pq_params,
-        ))),
+        )),
 
-        "IVF_HNSW_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_sq_params(
+        "IVF_HNSW_SQ" => Ok(VectorIndexParams::with_ivf_hnsw_sq_params(
             m_type,
             ivf_params,
             hnsw_params,
             sq_params,
-        ))),
+        )),
 
         _ => Err(PyValueError::new_err(format!(
             "Index type '{index_type}' is not supported."
@@ -5231,6 +5282,9 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
+    if let Some(pca_params) = pca_params {
+        params = params.with_pca(pca_params);
+    }
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?
     {
@@ -5238,7 +5292,7 @@ fn prepare_vector_index_params(
             .runtime_hints
             .insert("lancedb.accelerator".to_string(), acc.to_string());
     }
-    Ok(params)
+    Ok(Box::new(params))
 }
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
