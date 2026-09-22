@@ -31,7 +31,9 @@ pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
+pub mod pca;
 pub mod pq;
+pub mod pretransform;
 pub mod quantizer;
 pub mod residual;
 pub mod shared;
@@ -282,6 +284,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// not benefit from the sequential fast path.
     fn auto_query_parallelism(&self, _cpu_pool_size: usize) -> usize {
         1
+    }
+
+    /// Prepare a query and index pair for the partition-search stage.
+    ///
+    /// Decorators can transform the query once and return their wrapped index,
+    /// allowing both sequential and partition-parallel execution to reuse the
+    /// prepared query. The default returns `None` to keep the original pair.
+    fn prepare_partition_query(
+        self: Arc<Self>,
+        _query: &Query,
+    ) -> Result<Option<(Arc<dyn VectorIndex>, Query)>>
+    where
+        Self: 'static,
+    {
+        Ok(None)
     }
 
     /// Search a range of partitions and return a stream of per-partition result batches.
