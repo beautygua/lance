@@ -35,6 +35,7 @@ use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder, LanceCache, WeakLanceCache,
 };
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
@@ -44,9 +45,9 @@ use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
+use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::RowIdRemapper;
+use lance_index::scalar::{IndexReader, RowIdRemapper};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
@@ -56,7 +57,11 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::pca::{
+    PCA_METADATA_KEY, PcaModel, decode_pca_model, encode_pca_model, read_pca_model,
+};
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pretransform::PreTransformIndex;
 use lance_index::vector::quantizer::{
     QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
 };
@@ -95,6 +100,67 @@ use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
+struct PcaFileReaderAdapter<'a> {
+    reader: &'a FileReader,
+    schema: LanceSchema,
+}
+
+impl<'a> PcaFileReaderAdapter<'a> {
+    fn new(reader: &'a FileReader) -> Result<Self> {
+        Ok(Self {
+            reader,
+            schema: reader.schema().as_ref().try_into()?,
+        })
+    }
+}
+
+#[async_trait]
+impl IndexReader for PcaFileReaderAdapter<'_> {
+    async fn read_record_batch(&self, _n: u64, _batch_size: u64) -> Result<RecordBatch> {
+        Err(Error::not_supported(
+            "PCA file-reader adapter does not read record batches",
+        ))
+    }
+
+    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+        self.reader.read_global_buffer(index).await
+    }
+
+    async fn read_range(
+        &self,
+        _range: std::ops::Range<usize>,
+        _projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        Err(Error::not_supported(
+            "PCA file-reader adapter does not read row ranges",
+        ))
+    }
+
+    async fn num_batches(&self, _batch_size: u64) -> u32 {
+        0
+    }
+
+    fn num_rows(&self) -> usize {
+        self.reader.metadata().num_rows as usize
+    }
+
+    fn schema(&self) -> &LanceSchema {
+        &self.schema
+    }
+}
+
+/// Loads the optional PCA model declared by an index file's schema metadata.
+pub(crate) async fn read_pca_model_from_file(reader: &FileReader) -> Result<Option<Arc<PcaModel>>> {
+    let Some(buffer_index) = reader.schema().metadata.get(PCA_METADATA_KEY) else {
+        return Ok(None);
+    };
+    let adapter = PcaFileReaderAdapter::new(reader)?;
+    read_pca_model(&adapter, buffer_index)
+        .await
+        .map(Arc::new)
+        .map(Some)
+}
+
 /// Serializable state of an IVF index, sufficient to reconstruct the index
 /// without re-reading global buffers from object storage.
 ///
@@ -124,6 +190,8 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// when reconstructing from cache.
     pub(crate) index_file_size: u64,
     pub(crate) aux_file_size: u64,
+    /// Optional query-space PCA transform restored with the cached index.
+    pub(crate) pca: Option<Arc<PcaModel>>,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
 }
@@ -620,6 +688,7 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
             + self.aux_ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)
+            + self.pca.deep_size_of_children(context)
             + self
                 .rq_search_cache
                 .lock()
@@ -638,6 +707,9 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
 /// hot paths call `reconstruct` without knowing `Q`.
 pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
     fn serialize_state(&self, w: &mut CacheEntryWriter<'_>) -> Result<()>;
+
+    /// Returns the cached PCA model for manifest validation.
+    fn pca(&self) -> Option<&Arc<PcaModel>>;
 
     fn reconstruct<'a>(
         &'a self,
@@ -668,16 +740,18 @@ impl DeepSizeOf for IvfStateEntryBox {
 /// RAW_BLOB : IVF model protobuf
 /// RAW_BLOB : quantizer extra-metadata buffer (may be empty)
 /// RAW_BLOB : auxiliary IVF model protobuf
+/// RAW_BLOB : stable PCA model protobuf (v2; empty when PCA is absent)
 /// ```
 impl CacheCodecImpl for IvfStateEntryBox {
     const TYPE_ID: &'static str = "lance.vector.ivf.IvfState";
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         self.0.serialize_state(w)
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let version = r.version();
         // Parse the common header, then dispatch on quantization_type to
         // construct the right IvfIndexState<Q>.
         let header: IvfStateHeader = r.read_header()?;
@@ -696,6 +770,60 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}"))
             })?)?;
 
+        let pca = match version {
+            1 => None,
+            2 => {
+                let pca_bytes = r.read_raw().map_err(|error| {
+                    Error::io(format!(
+                        "IvfIndexState PCA blob read failed: version={version}, blob_len=unavailable, fingerprint={:?}: {error}",
+                        header.pca_fingerprint
+                    ))
+                })?;
+                let blob_len = pca_bytes.len();
+                match (pca_bytes.is_empty(), header.pca_fingerprint.as_deref()) {
+                    (true, None) => None,
+                    (true, Some(fingerprint)) => {
+                        return Err(Error::io(format!(
+                            "IvfIndexState PCA metadata mismatch: version={version}, blob_len={blob_len}, fingerprint_len={}, fingerprint={fingerprint:?}: empty blob has fingerprint",
+                            fingerprint.len()
+                        )));
+                    }
+                    (false, None) => {
+                        return Err(Error::io(format!(
+                            "IvfIndexState PCA metadata mismatch: version={version}, blob_len={blob_len}, fingerprint=None: non-empty blob is missing fingerprint"
+                        )));
+                    }
+                    (false, Some(fingerprint)) if fingerprint.len() != 32 => {
+                        return Err(Error::io(format!(
+                            "IvfIndexState PCA fingerprint length mismatch: version={version}, blob_len={blob_len}, fingerprint_len={}, fingerprint={fingerprint:?}, expected=32",
+                            fingerprint.len()
+                        )));
+                    }
+                    (false, Some(fingerprint)) => {
+                        let model = decode_pca_model(&pca_bytes).map_err(|error| {
+                            Error::io(format!(
+                                "IvfIndexState PCA decode failed: version={version}, blob_len={blob_len}, fingerprint_len={}, fingerprint={fingerprint:?}: {error}",
+                                fingerprint.len()
+                            ))
+                        })?;
+                        let actual_fingerprint = model.fingerprint();
+                        if fingerprint != actual_fingerprint.as_slice() {
+                            return Err(Error::io(format!(
+                                "IvfIndexState PCA fingerprint mismatch: version={version}, blob_len={blob_len}, fingerprint_len={}, expected={fingerprint:?}, actual={actual_fingerprint:?}",
+                                fingerprint.len()
+                            )));
+                        }
+                        Some(Arc::new(model))
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::io(format!(
+                    "IvfIndexState unsupported cache version={version}; expected version 1 or 2"
+                )));
+            }
+        };
+
         let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
         let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
         let quantization_type = header.quantization_type.parse::<QuantizationType>()?;
@@ -704,17 +832,18 @@ impl CacheCodecImpl for IvfStateEntryBox {
         // then build an IvfStateEntryBox wrapping IvfIndexState<Q>.
         fn make_entry<Q: Quantization + 'static>(
             header: IvfStateHeader,
-            ivf: IvfModel,
-            aux_ivf: IvfModel,
+            ivf_models: (IvfModel, IvfModel),
             extra_bytes: bytes::Bytes,
             distance_type: DistanceType,
             sub_index_type: SubIndexType,
             quantization_type: QuantizationType,
+            pca: Option<Arc<PcaModel>>,
         ) -> Result<IvfStateEntryBox>
         where
             <Q::Storage as QuantizerStorage>::Metadata:
                 serde::de::DeserializeOwned + QuantizerMetadata,
         {
+            let (ivf, aux_ivf) = ivf_models;
             let mut metadata: <Q::Storage as QuantizerStorage>::Metadata =
                 serde_json::from_str(&header.quantizer_metadata_json)
                     .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;
@@ -733,6 +862,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 quantization_type,
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
+                pca,
                 rq_search_cache: empty_rabit_search_cache_cell(),
             })))
         }
@@ -740,59 +870,69 @@ impl CacheCodecImpl for IvfStateEntryBox {
         match quantization_type {
             QuantizationType::Flat => make_entry::<FlatQuantizer>(
                 header,
-                ivf,
-                aux_ivf,
+                (ivf, aux_ivf),
                 extra_bytes,
                 distance_type,
                 sub_index_type,
                 quantization_type,
+                pca,
             ),
             QuantizationType::FlatBin => make_entry::<FlatBinQuantizer>(
                 header,
-                ivf,
-                aux_ivf,
+                (ivf, aux_ivf),
                 extra_bytes,
                 distance_type,
                 sub_index_type,
                 quantization_type,
+                pca,
             ),
             QuantizationType::Product => make_entry::<ProductQuantizer>(
                 header,
-                ivf,
-                aux_ivf,
+                (ivf, aux_ivf),
                 extra_bytes,
                 distance_type,
                 sub_index_type,
                 quantization_type,
+                pca,
             ),
             QuantizationType::Scalar => make_entry::<ScalarQuantizer>(
                 header,
-                ivf,
-                aux_ivf,
+                (ivf, aux_ivf),
                 extra_bytes,
                 distance_type,
                 sub_index_type,
                 quantization_type,
+                pca,
             ),
             QuantizationType::Rabit => make_entry::<RabitQuantizer>(
                 header,
-                ivf,
-                aux_ivf,
+                (ivf, aux_ivf),
                 extra_bytes,
                 distance_type,
                 sub_index_type,
                 quantization_type,
+                pca,
             ),
         }
     }
 }
 
 impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
+    fn pca(&self) -> Option<&Arc<PcaModel>> {
+        self.pca.as_ref()
+    }
+
     fn serialize_state(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let quantizer_metadata_json = serde_json::to_string(&self.metadata)
             .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;
         let extra = self.metadata.extra_metadata()?;
         let extra = extra.as_deref().unwrap_or(&[]);
+        let pca_bytes = self
+            .pca
+            .as_deref()
+            .map(encode_pca_model)
+            .transpose()?
+            .unwrap_or_default();
 
         let header = IvfStateHeader {
             index_file_path: self.index_file_path.clone(),
@@ -804,6 +944,11 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             quantizer_metadata_json,
             index_file_size: self.index_file_size,
             aux_file_size: self.aux_file_size,
+            pca_fingerprint: self
+                .pca
+                .as_deref()
+                .map(PcaModel::fingerprint)
+                .map(Vec::from),
         };
         let ivf_bytes = pb::Ivf::try_from(&self.ivf)?.encode_to_vec();
         let aux_ivf_bytes = pb::Ivf::try_from(&self.aux_ivf)?.encode_to_vec();
@@ -812,6 +957,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         w.write_raw(&ivf_bytes)?;
         w.write_raw(extra)?;
         w.write_raw(&aux_ivf_bytes)?;
+        w.write_raw(&pca_bytes)?;
         Ok(())
     }
 
@@ -823,7 +969,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>> {
         Box::pin(async move {
-            match self.sub_index_type {
+            let inner = match self.sub_index_type {
                 SubIndexType::Flat => {
                     reconstruct_typed::<FlatIndex, Q>(
                         self,
@@ -844,6 +990,11 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                     )
                     .await
                 }
+            }?;
+            match &self.pca {
+                Some(model) => Ok(Arc::new(PreTransformIndex::new_pca(inner, model.clone()))
+                    as Arc<dyn VectorIndex>),
+                None => Ok(inner),
             }
         })
     }
@@ -1971,8 +2122,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
     }
 
-    /// Export the index state needed for reconstruction from a disk cache.
-    pub(crate) fn to_state_entry(&self) -> IvfStateEntryBox {
+    /// Export reconstructable index state with an optional PCA query transform.
+    pub(crate) fn to_state_entry_with_pca(&self, pca: Option<Arc<PcaModel>>) -> IvfStateEntryBox {
         let (sub_index_type, quantization_type) = self.sub_index_type();
         IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
             index_file_path: self.index_path.clone(),
@@ -1986,6 +2137,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             quantization_type,
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
+            pca,
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
         }))
     }

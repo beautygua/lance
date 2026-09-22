@@ -7,6 +7,7 @@ use super::details::target_partition_size_from_details;
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
+    training_source::{DatasetVectorSource, PreTransformVectorSource, VectorTrainingDataSource},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
@@ -77,6 +78,7 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams};
+use lance_index::vector::pca::PcaModel;
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
 };
@@ -1739,8 +1741,67 @@ pub async fn build_ivf_model(
     fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
+    build_ivf_model_with_pca(
+        dataset,
+        column,
+        dim,
+        metric_type,
+        params,
+        IvfModelTrainingContext {
+            fragment_ids,
+            pca_model: None,
+            progress,
+        },
+    )
+    .await
+}
+
+pub struct IvfModelTrainingContext<'a> {
+    pub fragment_ids: Option<&'a [u32]>,
+    pub pca_model: Option<&'a PcaModel>,
+    pub progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+}
+
+pub async fn build_ivf_model_with_pca(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+    context: IvfModelTrainingContext<'_>,
+) -> Result<IvfModel> {
+    let IvfModelTrainingContext {
+        fragment_ids,
+        pca_model,
+        progress,
+    } = context;
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
+    let pca_source = if let Some(model) = pca_model {
+        if metric_type != MetricType::L2 {
+            return Err(Error::invalid_input(format!(
+                "PCA IVF training requires L2 distance, got {metric_type}"
+            )));
+        }
+        if centroids.is_some() {
+            return Err(Error::invalid_input(
+                "PCA IVF training does not support precomputed centroids".to_string(),
+            ));
+        }
+        let source = PreTransformVectorSource::try_new(
+            DatasetVectorSource::new(dataset, column, fragment_ids),
+            model,
+        )?;
+        if source.dimension()? != dim {
+            return Err(Error::invalid_input(format!(
+                "PCA output_dimension={} does not match IVF training dimension={dim}",
+                source.dimension()?
+            )));
+        }
+        Some(source)
+    } else {
+        None
+    };
     if let (Some(centroids), false) = (centroids.as_deref(), params.retrain) {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
         if centroids.values().len() != num_partitions * dim {
@@ -1787,6 +1848,7 @@ pub async fn build_ivf_model(
                 metric_type,
                 params,
                 fragment_ids,
+                pca_model,
                 progress,
             )
             .await?;
@@ -1803,8 +1865,10 @@ pub async fn build_ivf_model(
         "Loading training data for IVF. Sample size: {}",
         sample_size_hint
     );
-    let training_data =
-        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
+    let training_data = match pca_source.as_ref() {
+        Some(source) => source.sample(sample_size_hint).await?,
+        None => maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?,
+    };
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1826,7 +1890,17 @@ pub async fn build_ivf_model(
     };
 
     // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-    let training_data = filter_finite_training_data(training_data)?;
+    let training_data = if pca_source.is_none() {
+        filter_finite_training_data(training_data)?
+    } else {
+        training_data
+    };
+    if pca_source.is_some() && training_data.value_length() as usize != dim {
+        return Err(Error::invalid_input(format!(
+            "IVF training dimension={} does not match expected dimension={dim}",
+            training_data.value_length()
+        )));
+    }
 
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
@@ -3232,6 +3306,7 @@ async fn sample_ivf_training_chunk(
     sample_size_hint: usize,
     metric_type: MetricType,
     fragment_ids: Option<&[u32]>,
+    pca_model: Option<&PcaModel>,
 ) -> Result<(FixedSizeListArray, MetricType)> {
     let training_data =
         maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
@@ -3241,7 +3316,30 @@ async fn sample_ivf_training_chunk(
     } else {
         (training_data, metric_type)
     };
-    Ok((filter_finite_training_data(training_data)?, mt))
+    maybe_apply_pca_to_training_chunk(filter_finite_training_data(training_data)?, mt, pca_model)
+}
+
+fn maybe_apply_pca_to_training_chunk(
+    training_data: FixedSizeListArray,
+    metric_type: MetricType,
+    pca_model: Option<&PcaModel>,
+) -> Result<(FixedSizeListArray, MetricType)> {
+    let Some(model) = pca_model else {
+        return Ok((training_data, metric_type));
+    };
+    if metric_type != MetricType::L2 {
+        return Err(Error::invalid_input(format!(
+            "PCA IVF training requires L2 distance, got {metric_type}"
+        )));
+    }
+    if model.input_dimension() != training_data.value_length() as usize {
+        return Err(Error::invalid_input(format!(
+            "PCA input_dimension={} does not match streaming training vector dimension={}",
+            model.input_dimension(),
+            training_data.value_length()
+        )));
+    }
+    Ok((model.transform(&training_data)?, MetricType::L2))
 }
 
 #[derive(Debug, Clone)]
@@ -3787,6 +3885,7 @@ async fn refine_streaming_f32_kmeans_with_sampler(
     initial_centroids: &FixedSizeListArray,
     passes: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
+    pca_model: Option<&PcaModel>,
 ) -> Result<FixedSizeListArray> {
     let dimension = initial_centroids.value_length() as usize;
     let mut centroids = initial_centroids.clone();
@@ -3799,6 +3898,8 @@ async fn refine_streaming_f32_kmeans_with_sampler(
             let ranges = sample_ranges.chunk(row_offset, streaming_sample_size.max(1));
             row_offset += ranges.iter().map(range_len).sum::<usize>();
             let (training_data, mt) = sampler.sample_ranges(&ranges, metric_type).await?;
+            let (training_data, mt) =
+                maybe_apply_pca_to_training_chunk(training_data, mt, pca_model)?;
             if mt != DistanceType::L2 {
                 return Err(Error::invalid_input(format!(
                     "streaming IVF refinement currently supports L2/Cosine training, got {}",
@@ -3806,6 +3907,12 @@ async fn refine_streaming_f32_kmeans_with_sampler(
                 )));
             }
             let training_data = cast_training_data_to_f32(training_data)?;
+            if training_data.value_length() as usize != dimension {
+                return Err(Error::invalid_input(format!(
+                    "streaming IVF refinement dimension={} does not match expected dimension={dimension}",
+                    training_data.value_length()
+                )));
+            }
             loss += accumulate_refine_assignments(
                 &training_data,
                 &centroids,
@@ -3838,6 +3945,7 @@ async fn refine_streaming_f32_kmeans_with_resampling(
     fragment_ids: Option<&[u32]>,
     passes: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
+    pca_model: Option<&PcaModel>,
 ) -> Result<FixedSizeListArray> {
     let dimension = initial_centroids.value_length() as usize;
     let mut centroids = initial_centroids.clone();
@@ -3855,6 +3963,7 @@ async fn refine_streaming_f32_kmeans_with_resampling(
                 step_sample_size,
                 metric_type,
                 fragment_ids,
+                pca_model,
             )
             .await?;
             if mt != DistanceType::L2 {
@@ -3864,6 +3973,12 @@ async fn refine_streaming_f32_kmeans_with_resampling(
                 )));
             }
             let training_data = cast_training_data_to_f32(training_data)?;
+            if training_data.value_length() as usize != dimension {
+                return Err(Error::invalid_input(format!(
+                    "streaming IVF refinement dimension={} does not match expected dimension={dimension}",
+                    training_data.value_length()
+                )));
+            }
             loss += accumulate_refine_assignments(
                 &training_data,
                 &centroids,
@@ -4552,6 +4667,7 @@ async fn finish_streaming_ivf_training<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn train_streaming_coreset_ivf_model(
     dataset: &Dataset,
     column: &str,
@@ -4559,6 +4675,7 @@ async fn train_streaming_coreset_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
     fragment_ids: Option<&[u32]>,
+    pca_model: Option<&PcaModel>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap_or(32);
@@ -4636,7 +4753,8 @@ async fn train_streaming_coreset_ivf_model(
             {
                 let ranges = sample_ranges.chunk(sample_offset, step_sample_size);
                 sample_offset += ranges.iter().map(range_len).sum::<usize>();
-                sampler.sample_ranges(&ranges, metric_type).await?
+                let (training_data, mt) = sampler.sample_ranges(&ranges, metric_type).await?;
+                maybe_apply_pca_to_training_chunk(training_data, mt, pca_model)?
             } else {
                 sample_ivf_training_chunk(
                     dataset,
@@ -4644,6 +4762,7 @@ async fn train_streaming_coreset_ivf_model(
                     step_sample_size,
                     metric_type,
                     fragment_ids,
+                    pca_model,
                 )
                 .await?
             };
@@ -4654,6 +4773,12 @@ async fn train_streaming_coreset_ivf_model(
                 )));
             }
             let training_data = cast_training_data_to_f32(training_data)?;
+            if training_data.value_length() as usize != dimension {
+                return Err(Error::invalid_input(format!(
+                    "streaming coreset IVF training dimension={} does not match expected dimension={dimension}",
+                    training_data.value_length()
+                )));
+            }
             if training_data.len() < num_partitions {
                 return Err(Error::index(format!(
                     "Not enough training vectors for streaming coreset IVF. Requires at least {} rows but sampled {} rows",
@@ -4666,7 +4791,7 @@ async fn train_streaming_coreset_ivf_model(
             total_training_vectors += training_data.len();
             let local_k = streaming_local_coreset_k(
                 num_partitions,
-                training_data.len(),
+                step_sample_size,
                 coreset_rate,
                 total_steps,
                 decoupled_coreset_budget,
@@ -4740,6 +4865,7 @@ async fn train_streaming_coreset_ivf_model(
                     &centroids,
                     params.streaming_refine_passes,
                     on_progress.clone(),
+                    pca_model,
                 )
                 .await?
             } else {
@@ -4754,6 +4880,7 @@ async fn train_streaming_coreset_ivf_model(
                     fragment_ids,
                     params.streaming_refine_passes,
                     on_progress.clone(),
+                    pca_model,
                 )
                 .await?
             };
@@ -4780,6 +4907,7 @@ async fn train_streaming_coreset_ivf_model(
     Ok(ivf_model)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn train_streaming_ivf_model(
     dataset: &Dataset,
     column: &str,
@@ -4787,6 +4915,7 @@ async fn train_streaming_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
     fragment_ids: Option<&[u32]>,
+    pca_model: Option<&PcaModel>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap_or(32);
@@ -4798,6 +4927,7 @@ async fn train_streaming_ivf_model(
             metric_type,
             params,
             fragment_ids,
+            pca_model,
             progress,
         )
         .await;
@@ -4846,8 +4976,15 @@ async fn train_streaming_ivf_model(
                 step_sample_size,
                 metric_type,
                 fragment_ids,
+                pca_model,
             )
             .await?;
+            if training_data.value_length() as usize != dimension {
+                return Err(Error::invalid_input(format!(
+                    "streaming IVF training dimension={} does not match expected dimension={dimension}",
+                    training_data.value_length()
+                )));
+            }
             if training_data.len() < num_partitions {
                 return Err(Error::index(format!(
                     "Not enough training vectors for streaming IVF. Requires at least {} rows but sampled {} rows",
@@ -6333,6 +6470,76 @@ mod tests {
         );
     }
 
+    async fn train_test_pca_model(
+        dataset: &Dataset,
+        column: &str,
+        input_dim: usize,
+        output_dim: usize,
+    ) -> Arc<PcaModel> {
+        use lance_index::vector::pca::PcaParams;
+
+        let training_data = maybe_sample_training_data(dataset, column, 1_024, None)
+            .await
+            .unwrap();
+        let training_data = filter_finite_training_data(training_data).unwrap();
+        assert_eq!(training_data.value_length() as usize, input_dim);
+        Arc::new(
+            PcaModel::train(
+                &training_data,
+                &PcaParams::new(output_dim).with_sample_size(training_data.len()),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_model_streaming_training_with_pca() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let reader = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(512), BatchCount::from(2));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+        let pca_model = train_test_pca_model(&dataset, "vector", 32, 16).await;
+
+        let mut params = IvfBuildParams::new(8);
+        params.sample_rate = 16;
+        params.streaming_sample_rate = Some(4);
+        params.streaming_refine_passes = 1;
+        params.max_iters = 2;
+
+        let ivf_model = build_ivf_model_with_pca(
+            &dataset,
+            "vector",
+            16,
+            MetricType::L2,
+            &params,
+            IvfModelTrainingContext {
+                fragment_ids: None,
+                pca_model: Some(pca_model.as_ref()),
+                progress: lance_index::progress::noop_progress(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ivf_model.num_partitions(), 8);
+        assert_eq!(ivf_model.dimension(), 16);
+        assert!(ivf_model.loss().is_none());
+        assert!(
+            ivf_model
+                .centroids
+                .as_ref()
+                .unwrap()
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_ivf_error_joins_progress_worker() {
         let test_dir = TempStrDir::default();
@@ -6370,6 +6577,7 @@ mod tests {
                     MetricType::L2,
                     &params,
                     None,
+                    None,
                     progress,
                 )
                 .await
@@ -6398,13 +6606,13 @@ mod tests {
             .expect("streaming IVF trainer task panicked")
             .expect_err("the mismatched dimension should fail training");
         assert!(
-            matches!(error, Error::Arrow { .. }),
-            "expected the primary centroid conversion error, got: {error}"
+            matches!(error, Error::InvalidInput { .. }),
+            "expected the primary dimension validation error, got: {error}"
         );
         assert!(
-            error
-                .to_string()
-                .contains("Incorrect length of values buffer for FixedSizeListArray"),
+            error.to_string().contains(
+                "streaming IVF training dimension=32 does not match expected dimension=31"
+            ),
             "unexpected training error: {error}"
         );
         assert!(
@@ -6703,6 +6911,93 @@ mod tests {
         assert!(
             error.to_string().contains("UInt16"),
             "the error must name the rejected type: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_ivf_training_with_pca_terminates() {
+        use lance_index::progress::IndexBuildProgress;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        #[derive(Debug, Default)]
+        struct CountingProgress {
+            progress_calls: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl IndexBuildProgress for CountingProgress {
+            async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn stage_progress(&self, _: &str, _: u64) -> Result<()> {
+                self.progress_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            async fn stage_complete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        const INPUT_DIM: usize = 16;
+        const OUTPUT_DIM: usize = 8;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let reader = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>((INPUT_DIM as u32).into()),
+            )
+            .into_reader_rows(RowCount::from(2048), BatchCount::from(4));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+        let pca_model = train_test_pca_model(&dataset, "vector", INPUT_DIM, OUTPUT_DIM).await;
+
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 8;
+        params.streaming_sample_rate = Some(4);
+        params.streaming_refine_passes = 1;
+        params.max_iters = 2;
+
+        let progress = Arc::new(CountingProgress::default());
+        let ivf_model = tokio::time::timeout(
+            Duration::from_secs(120),
+            build_ivf_model_with_pca(
+                &dataset,
+                "vector",
+                OUTPUT_DIM,
+                MetricType::L2,
+                &params,
+                IvfModelTrainingContext {
+                    fragment_ids: None,
+                    pca_model: Some(pca_model.as_ref()),
+                    progress: progress.clone(),
+                },
+            ),
+        )
+        .await
+        .expect(
+            "PCA streaming coreset IVF training hung: progress worker never terminated after training",
+        )
+        .unwrap();
+
+        assert_eq!(ivf_model.num_partitions(), 257);
+        assert_eq!(ivf_model.dimension(), OUTPUT_DIM);
+        assert!(
+            progress.progress_calls.load(Ordering::Relaxed) > 0,
+            "expected the progress worker to receive at least one report"
+        );
+        assert!(
+            ivf_model
+                .centroids
+                .as_ref()
+                .unwrap()
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|value| value.is_finite())
         );
     }
 

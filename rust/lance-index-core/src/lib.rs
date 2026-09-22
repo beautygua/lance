@@ -238,7 +238,9 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => 1,
-            Self::IvfRq => 2,
+            // Reader compatibility ceiling. Writers select the actual manifest
+            // version from their complete vector build parameters.
+            Self::IvfRq => 3,
         }
     }
 

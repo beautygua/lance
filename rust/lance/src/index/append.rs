@@ -28,6 +28,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use super::vector::details::pca_params_from_details;
 use super::vector::ivf::{
     SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
@@ -806,6 +807,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
     let (new_uuid, removed_indices, new_fragment_bitmap, created_index, new_dataset_version) =
         if first_is_vector_index {
+            for metadata in old_indices {
+                if let Some(details) = metadata.index_details.as_deref()
+                    && pca_params_from_details(details)?.is_some()
+                {
+                    return Err(Error::not_supported(
+                        "Appending or optimizing PCA vector indices is not supported",
+                    ));
+                }
+            }
+
             // Segments with stored rows (raw coverage) but no live coverage
             // (e.g. a definition retained through a full rewrite) are dormant.
             // With stable row ids their stored postings still share ids with
@@ -842,7 +853,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             if rebuild_dormant && unindexed.is_empty() {
                 return Ok(None);
             }
-
             let full_logical_index = dataset
                 .open_logical_vector_index(&field_path, &old_indices[0].name)
                 .await?;
@@ -944,8 +954,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     removed_indices: Vec::new(),
                     new_fragment_bitmap: base_unindexed_bitmap,
                     new_dataset_version: dataset.manifest.version,
-                    new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
-                        .version(),
+                    new_index_version: reference_metadata.index_version,
                     new_index_details: reference_metadata
                         .index_details
                         .as_deref()
@@ -1099,7 +1108,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
                 // Metadata must come from an actual merge source. Older incompatible
                 // segments outside the selected suffix may describe a different model.
-                let (reference_metadata, reference_index) =
+                let (reference_metadata, _) =
                     merge_logical_index.iter().last().ok_or_else(|| {
                         Error::index(
                             "Optimize vector index merge did not select a reference segment"
@@ -1123,7 +1132,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 let index_version = if let Some(metadata) = removed_indices.first() {
                     metadata.index_version as u32
                 } else {
-                    index_type_for_segmented_optimize(reference_index.as_ref())?.version() as u32
+                    reference_metadata.index_version as u32
                 };
 
                 Ok((
@@ -2505,7 +2514,8 @@ mod tests {
         assert!(
             appended_segments
                 .iter()
-                .all(|segment| segment.index_version == index_params.index_type().version()),
+                .all(|segment| segment.index_version
+                    == index_params.compatibility_version() as i32),
             "append must preserve the storage type's index version"
         );
         let logical_index = dataset
@@ -2591,7 +2601,7 @@ mod tests {
         );
         assert_eq!(
             merged[0].index_version,
-            index_params.index_type().version(),
+            index_params.compatibility_version() as i32,
             "merge must preserve the storage type's index version"
         );
         assert_eq!(

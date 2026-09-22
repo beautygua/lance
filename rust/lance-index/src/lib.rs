@@ -43,8 +43,11 @@ pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 /// Most vector indices should use this version unless they need to bump for a
 /// format change.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
-/// Version for IVF_RQ indices.
-pub const IVF_RQ_INDEX_VERSION: u32 = 2;
+/// Highest IVF_RQ manifest compatibility version this reader supports.
+///
+/// Writers must derive the emitted version from their complete build
+/// parameters instead of using this reader ceiling.
+pub const IVF_RQ_INDEX_VERSION: u32 = 3;
 
 /// The factor of threshold to trigger split / join for vector index.
 ///
@@ -98,9 +101,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ivf_rq_has_dedicated_index_version() {
+    fn test_ivf_rq_reader_supports_pca_compatibility_version() {
         assert!(IndexType::IvfRq.version() > IndexType::IvfPq.version());
         assert_eq!(IndexType::IvfRq.version() as u32, IVF_RQ_INDEX_VERSION);
+        assert_eq!(IVF_RQ_INDEX_VERSION, 3);
+        assert_eq!(IndexType::IvfFlat.version() as u32, VECTOR_INDEX_VERSION);
+        assert_eq!(IndexType::IvfPq.version() as u32, VECTOR_INDEX_VERSION);
+        assert_eq!(IndexType::IvfSq.version() as u32, VECTOR_INDEX_VERSION);
     }
 
     #[test]
