@@ -3361,7 +3361,7 @@ impl DatasetIndexInternalExt for Dataset {
             index_meta: &IndexMetadata,
             input_dimension: usize,
         ) -> Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> {
-            let entry = ivf.to_state_entry_with_pca(pca_model.clone());
+            let entry = ivf.to_state_entry(pca_model.clone());
             let inner = Arc::new(ivf) as Arc<dyn VectorIndex>;
             let index = match pca_model.as_ref() {
                 Some(model) => Arc::new(PreTransformIndex::new_pca(inner, model.clone()))

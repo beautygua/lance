@@ -2122,8 +2122,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
     }
 
-    /// Export reconstructable index state with an optional PCA query transform.
-    pub(crate) fn to_state_entry_with_pca(&self, pca: Option<Arc<PcaModel>>) -> IvfStateEntryBox {
+    /// Export the index state needed for reconstruction from a disk cache.
+    ///
+    /// `pca` is the query pre-transform restored together with the index;
+    /// `None` for indices built without PCA.
+    pub(crate) fn to_state_entry(&self, pca: Option<Arc<PcaModel>>) -> IvfStateEntryBox {
         let (sub_index_type, quantization_type) = self.sub_index_type();
         IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
             index_file_path: self.index_path.clone(),
