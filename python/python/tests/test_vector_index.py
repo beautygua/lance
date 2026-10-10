@@ -394,12 +394,6 @@ def test_create_index_progress_callback_vector(tmp_path):
     ]
     positions = [tags.index(tag) for tag in expected_order]
     assert positions == sorted(positions)
-    for event in recorder.events:
-        if event.event == "complete":
-            assert event.elapsed_seconds is not None
-            assert event.elapsed_seconds >= 0.0
-        else:
-            assert event.elapsed_seconds is None
 
     shuffle_progress = stage_progress_values(recorder.events, "shuffle")
     assert shuffle_progress

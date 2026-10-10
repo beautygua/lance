@@ -32,9 +32,6 @@ class IndexProgress:
         The total amount of work for the stage, if known.
     unit : str
         The unit of work for ``completed`` / ``total``.
-    elapsed_seconds : float, optional
-        Stage wall-clock duration reported on ``"complete"`` events. It is
-        ``None`` for ``"start"`` and ``"progress"`` events.
     """
 
     event: Literal["start", "progress", "complete"]
@@ -42,7 +39,6 @@ class IndexProgress:
     completed: Optional[int] = None
     total: Optional[int] = None
     unit: str = ""
-    elapsed_seconds: Optional[float] = None
 
     @property
     def fraction(self) -> Optional[float]:
