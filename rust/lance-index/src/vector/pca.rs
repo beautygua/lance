@@ -19,9 +19,8 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use prost::Message;
+use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha8Rng;
-use sha2::{Digest, Sha256};
 
 use crate::pb;
 use crate::scalar::{IndexReader, IndexWriter};
@@ -973,7 +972,7 @@ impl PcaModel {
         self.training_stats.as_ref()
     }
 
-    /// Returns the stable SHA-256 identity of this model's numerical transform.
+    /// Returns the stable BLAKE3 identity of this model's numerical transform.
     ///
     /// The digest covers the PCA v1 domain separator, model version, row-major
     /// transform matrix, and mean. Floating-point values use little-endian
@@ -983,9 +982,9 @@ impl PcaModel {
     }
 
     fn compute_fingerprint(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(PCA_FINGERPRINT_DOMAIN);
-        hasher.update(PCA_MODEL_VERSION.to_le_bytes());
+        hasher.update(&PCA_MODEL_VERSION.to_le_bytes());
         for value in self
             .transform_matrix
             .values()
@@ -993,9 +992,9 @@ impl PcaModel {
             .chain(self.mean.values())
         {
             let canonical = if *value == 0.0 { 0.0 } else { *value };
-            hasher.update(canonical.to_le_bytes());
+            hasher.update(&canonical.to_le_bytes());
         }
-        hasher.finalize().into()
+        *hasher.finalize().as_bytes()
     }
 
     fn validate_trained(&self, training_data: &FixedSizeListArray) -> Result<()> {
@@ -1685,7 +1684,7 @@ fn deterministic_gaussian_matrix(dimension: usize, seed: u64) -> Result<Vec<f64>
     let length = dimension
         .checked_mul(dimension)
         .ok_or_else(|| Error::invalid_input("PCA random rotation shape overflows usize"))?;
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(seed);
     let mut values = Vec::with_capacity(length);
     while values.len() < length {
         let a = rng.next_u64() >> 11;
@@ -2298,7 +2297,7 @@ mod tests {
     #[test]
     fn box_muller_has_stable_prefix() {
         let values = deterministic_gaussian_matrix(2, 5).expect("generation should work");
-        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let mut rng = SmallRng::seed_from_u64(5);
         let mut expected = Vec::with_capacity(4);
         for _ in 0..2 {
             let a = rng.next_u64() >> 11;
@@ -2517,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_matches_independent_sha256_input() {
+    fn fingerprint_matches_independent_blake3_input() {
         let model = persisted_model(vec![-0.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![7.0, 8.0, 9.0]);
         assert!(model.fingerprint.get().is_none());
         let mut input = PCA_FINGERPRINT_DOMAIN.to_vec();
@@ -2525,7 +2524,7 @@ mod tests {
         for value in [0.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0] {
             input.extend_from_slice(&value.to_le_bytes());
         }
-        let expected: [u8; 32] = Sha256::digest(input).into();
+        let expected: [u8; 32] = *blake3::hash(&input).as_bytes();
         assert_eq!(model.fingerprint(), expected);
         assert_eq!(model.fingerprint.get(), Some(&expected));
         assert_eq!(model.fingerprint(), expected);

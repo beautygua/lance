@@ -1393,7 +1393,7 @@ def test_create_ivf_rq_with_pca():
     assert pre_transform["max_training_memory_bytes"] == 64 * 1024 * 1024
     assert pre_transform["sampling_seed"] == 17
     assert pre_transform["rotation_seed"] == 29
-    assert pre_transform["model_fingerprint"].startswith("sha256:")
+    assert pre_transform["model_fingerprint"].startswith("blake3:")
 
     actual_ids = set(
         ds.to_table(
@@ -1455,7 +1455,7 @@ def test_create_ivf_rq_with_pca_streaming():
     pre_transform = info.details["pre_transform"]
     assert pre_transform["type"] == "pca"
     assert pre_transform["dimension"] == 8
-    assert pre_transform["model_fingerprint"].startswith("sha256:")
+    assert pre_transform["model_fingerprint"].startswith("blake3:")
 
     def recall_for(dataset):
         actual_ids = set(

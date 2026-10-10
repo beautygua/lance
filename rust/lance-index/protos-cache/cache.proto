@@ -204,7 +204,7 @@ message IvfStateHeader {
   uint64 index_file_size = 9;
   uint64 aux_file_size = 10;
   // Absent when no PCA model is attached and the fourth raw blob is empty;
-  // present otherwise as the model's 32-byte SHA-256 fingerprint.
+  // present otherwise as the model's 32-byte BLAKE3 fingerprint.
   optional bytes pca_fingerprint = 11;
 }
 

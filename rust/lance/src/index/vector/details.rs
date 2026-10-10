@@ -600,7 +600,7 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
     let pre_transform = pca_params_from_details(details)?
         .map(|(params, model_fingerprint)| -> Result<PcaDetailsJson> {
             let mut fingerprint = String::with_capacity(7 + model_fingerprint.len() * 2);
-            fingerprint.push_str("sha256:");
+            fingerprint.push_str("blake3:");
             for byte in model_fingerprint {
                 write!(&mut fingerprint, "{byte:02x}")
                     .map_err(|e| Error::index(format!("Failed to format PCA fingerprint: {e}")))?;
@@ -1218,7 +1218,7 @@ mod tests {
                 "sampling_seed": 7,
                 "rotation_seed": 11,
                 "model_fingerprint":
-                    "sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+                    "blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
             }
         });
         assert_eq!(
@@ -1227,7 +1227,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            r#"{"metric_type":"L2","pre_transform":{"type":"pca","dimension":16,"random_rotation":true,"whitening":true,"epsilon":0.0001,"sample_size":2048,"max_training_memory_bytes":16777216,"sampling_seed":7,"rotation_seed":11,"model_fingerprint":"sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}"#
+            r#"{"metric_type":"L2","pre_transform":{"type":"pca","dimension":16,"random_rotation":true,"whitening":true,"epsilon":0.0001,"sample_size":2048,"max_training_memory_bytes":16777216,"sampling_seed":7,"rotation_seed":11,"model_fingerprint":"blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}"#
         );
     }
 

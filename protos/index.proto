@@ -256,7 +256,7 @@ message PcaParameters {
   uint64 sampling_seed = 7;
   // Seed used to construct the deterministic random rotation.
   uint64 rotation_seed = 8;
-  // SHA-256 fingerprint of the exact trained model applied by the index.
+  // BLAKE3 fingerprint of the exact trained model applied by the index.
   // This must contain exactly 32 raw bytes and is required whenever this
   // message is present.
   bytes model_fingerprint = 9;
