@@ -3738,11 +3738,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(committed.index_version, 2);
+        assert_eq!(committed.index_version, IndexType::IvfRq.version());
 
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].index_version, 2);
+        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
     }
 
     #[tokio::test]

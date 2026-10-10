@@ -538,8 +538,7 @@ impl VectorIndexParams {
     /// Returns the manifest compatibility version required by these parameters.
     pub fn compatibility_version(&self) -> u32 {
         match (self.pre_transform.is_some(), self.index_type()) {
-            (true, IndexType::IvfRq) => 3,
-            (false, IndexType::IvfRq) => 2,
+            (true, IndexType::IvfRq) => lance_index::VECTOR_PRE_TRANSFORM_INDEX_VERSION,
             (_, index_type) => index_type.version() as u32,
         }
     }
@@ -4176,11 +4175,17 @@ mod tests {
     #[test]
     fn pca_uses_dynamic_manifest_compatibility_version() {
         let rq = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
-        assert_eq!(rq.compatibility_version(), 2);
+        assert_eq!(
+            rq.compatibility_version(),
+            IndexType::IvfRq.version() as u32
+        );
         assert!(rq.pca_params().is_none());
 
         let pca_rq = rq.with_pca(PcaParams::new(8));
-        assert_eq!(pca_rq.compatibility_version(), 3);
+        assert_eq!(
+            pca_rq.compatibility_version(),
+            lance_index::VECTOR_PRE_TRANSFORM_INDEX_VERSION
+        );
         assert_eq!(pca_rq.pca_params().map(|params| params.dimension), Some(8));
 
         let pca_flat = VectorIndexParams::ivf_flat(4, DistanceType::L2).with_pca(PcaParams::new(8));

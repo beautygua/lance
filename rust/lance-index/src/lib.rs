@@ -28,7 +28,7 @@ pub mod vector;
 pub use crate::traits::*;
 
 // Re-export core traits from lance-index-core
-pub use lance_index_core::{Index, IndexParams, IndexType};
+pub use lance_index_core::{Index, IndexParams, IndexType, VECTOR_PRE_TRANSFORM_INDEX_VERSION};
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
 /// The name of the auxiliary index file.
@@ -43,11 +43,8 @@ pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 /// Most vector indices should use this version unless they need to bump for a
 /// format change.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
-/// Highest IVF_RQ manifest compatibility version this reader supports.
-///
-/// Writers must derive the emitted version from their complete build
-/// parameters instead of using this reader ceiling.
-pub const IVF_RQ_INDEX_VERSION: u32 = 3;
+/// Version for IVF_RQ indices.
+pub const IVF_RQ_INDEX_VERSION: u32 = 2;
 
 /// The factor of threshold to trigger split / join for vector index.
 ///
@@ -101,18 +98,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ivf_rq_reader_supports_pca_compatibility_version() {
+    fn test_ivf_rq_has_dedicated_index_version() {
         assert!(IndexType::IvfRq.version() > IndexType::IvfPq.version());
         assert_eq!(IndexType::IvfRq.version() as u32, IVF_RQ_INDEX_VERSION);
-        assert_eq!(IVF_RQ_INDEX_VERSION, 3);
-        assert_eq!(IndexType::IvfFlat.version() as u32, VECTOR_INDEX_VERSION);
-        assert_eq!(IndexType::IvfPq.version() as u32, VECTOR_INDEX_VERSION);
-        assert_eq!(IndexType::IvfSq.version() as u32, VECTOR_INDEX_VERSION);
     }
 
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
-        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+        assert!(VECTOR_PRE_TRANSFORM_INDEX_VERSION > IVF_RQ_INDEX_VERSION);
+        assert_eq!(
+            IndexType::max_vector_version(),
+            VECTOR_PRE_TRANSFORM_INDEX_VERSION
+        );
     }
 
     #[test]

@@ -954,7 +954,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     removed_indices: Vec::new(),
                     new_fragment_bitmap: base_unindexed_bitmap,
                     new_dataset_version: dataset.manifest.version,
-                    new_index_version: reference_metadata.index_version,
+                    new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
+                        .version(),
                     new_index_details: reference_metadata
                         .index_details
                         .as_deref()
@@ -1108,7 +1109,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
                 // Metadata must come from an actual merge source. Older incompatible
                 // segments outside the selected suffix may describe a different model.
-                let (reference_metadata, _) =
+                let (reference_metadata, reference_index) =
                     merge_logical_index.iter().last().ok_or_else(|| {
                         Error::index(
                             "Optimize vector index merge did not select a reference segment"
@@ -1132,7 +1133,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 let index_version = if let Some(metadata) = removed_indices.first() {
                     metadata.index_version as u32
                 } else {
-                    reference_metadata.index_version as u32
+                    index_type_for_segmented_optimize(reference_index.as_ref())?.version() as u32
                 };
 
                 Ok((
@@ -2514,8 +2515,7 @@ mod tests {
         assert!(
             appended_segments
                 .iter()
-                .all(|segment| segment.index_version
-                    == index_params.compatibility_version() as i32),
+                .all(|segment| segment.index_version == index_params.index_type().version()),
             "append must preserve the storage type's index version"
         );
         let logical_index = dataset
@@ -2601,7 +2601,7 @@ mod tests {
         );
         assert_eq!(
             merged[0].index_version,
-            index_params.compatibility_version() as i32,
+            index_params.index_type().version(),
             "merge must preserve the storage type's index version"
         );
         assert_eq!(
