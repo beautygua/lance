@@ -5234,35 +5234,41 @@ fn prepare_vector_index_params(
     }
 
     let mut params = match index_type {
-        "IVF_FLAT" => Ok(VectorIndexParams::with_ivf_flat_params(m_type, ivf_params)),
+        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::with_ivf_flat_params(
+            m_type, ivf_params,
+        ))),
 
-        "IVF_PQ" => Ok(VectorIndexParams::with_ivf_pq_params(
+        "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
             m_type, ivf_params, pq_params,
-        )),
+        ))),
 
-        "IVF_SQ" => Ok(VectorIndexParams::with_ivf_sq_params(
+        "IVF_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_sq_params(
             m_type, ivf_params, sq_params,
-        )),
+        ))),
 
-        "IVF_RQ" => Ok(VectorIndexParams::with_ivf_rq_params(
+        "IVF_RQ" => Ok(Box::new(VectorIndexParams::with_ivf_rq_params(
             m_type, ivf_params, rq_params,
-        )),
+        ))),
 
-        "IVF_HNSW_FLAT" => Ok(VectorIndexParams::ivf_hnsw(m_type, ivf_params, hnsw_params)),
+        "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
+            m_type,
+            ivf_params,
+            hnsw_params,
+        ))),
 
-        "IVF_HNSW_PQ" => Ok(VectorIndexParams::with_ivf_hnsw_pq_params(
+        "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
             m_type,
             ivf_params,
             hnsw_params,
             pq_params,
-        )),
+        ))),
 
-        "IVF_HNSW_SQ" => Ok(VectorIndexParams::with_ivf_hnsw_sq_params(
+        "IVF_HNSW_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_sq_params(
             m_type,
             ivf_params,
             hnsw_params,
             sq_params,
-        )),
+        ))),
 
         _ => Err(PyValueError::new_err(format!(
             "Index type '{index_type}' is not supported."
@@ -5270,9 +5276,7 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
-    if let Some(pca_params) = pca_params {
-        params = params.with_pca(pca_params);
-    }
+    params.pre_transform = pca_params;
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?
     {
@@ -5280,7 +5284,7 @@ fn prepare_vector_index_params(
             .runtime_hints
             .insert("lancedb.accelerator".to_string(), acc.to_string());
     }
-    Ok(Box::new(params))
+    Ok(params)
 }
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
