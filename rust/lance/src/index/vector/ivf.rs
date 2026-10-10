@@ -4791,7 +4791,7 @@ async fn train_streaming_coreset_ivf_model(
             total_training_vectors += training_data.len();
             let local_k = streaming_local_coreset_k(
                 num_partitions,
-                step_sample_size,
+                training_data.len(),
                 coreset_rate,
                 total_steps,
                 decoupled_coreset_budget,
