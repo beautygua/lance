@@ -291,6 +291,10 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Decorators can transform the query once and return their wrapped index,
     /// allowing both sequential and partition-parallel execution to reuse the
     /// prepared query. The default returns `None` to keep the original pair.
+    ///
+    /// Decorators such as [`crate::vector::pretransform::PreTransformIndex`]
+    /// must override every method that receives a query. A new method that keeps
+    /// this default will skip the pre-transform and search the original vectors.
     fn prepare_partition_query(
         self: Arc<Self>,
         _query: &Query,

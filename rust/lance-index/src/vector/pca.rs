@@ -31,6 +31,38 @@ pub const PCA_METADATA_KEY: &str = "lance:pca";
 /// Current stable PCA model serialization version.
 pub const PCA_MODEL_VERSION: u32 = 1;
 
+/// A PCA projection that produced a non-finite output component.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PcaNonFiniteOutput {
+    pub row: usize,
+    pub output_dimension: usize,
+    pub value: f32,
+}
+
+impl std::fmt::Display for PcaNonFiniteOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PCA transform produced a non-finite value at row={}, output_dimension={}, value={}",
+            self.row, self.output_dimension, self.value
+        )
+    }
+}
+
+impl std::error::Error for PcaNonFiniteOutput {}
+
+/// Returns the structured non-finite PCA output carried by `error`, if any.
+pub fn non_finite_output(error: &Error) -> Option<PcaNonFiniteOutput> {
+    let mut current = Some(error as &(dyn std::error::Error + 'static));
+    while let Some(err) = current {
+        if let Some(found) = err.downcast_ref::<PcaNonFiniteOutput>() {
+            return Some(*found);
+        }
+        current = err.source();
+    }
+    None
+}
+
 const PCA_MODEL_NAME: &str = "PCA model";
 const PCA_FINGERPRINT_DOMAIN: &[u8] = b"lance-vector-pre-transform:pca:v1";
 
@@ -902,10 +934,11 @@ impl PcaModel {
                 for column in 0..self.output_dimension {
                     let value = transformed[(row, column)];
                     if !value.is_finite() {
-                        return Err(Error::invalid_input(format!(
-                            "PCA transform produced a non-finite value at row={}, output_dimension={column}, value={value}",
-                            chunk_start + row,
-                        )));
+                        return Err(Error::invalid_input_source(Box::new(PcaNonFiniteOutput {
+                            row: chunk_start + row,
+                            output_dimension: column,
+                            value,
+                        })));
                     }
                     output.push(value);
                 }

@@ -19,7 +19,7 @@ use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_linalg::kernels::normalize_fsl;
 use tracing::instrument;
 
-use super::pca::PcaModel;
+use super::pca::{PcaModel, non_finite_output};
 
 /// Transform of a Vector Matrix.
 ///
@@ -193,17 +193,14 @@ impl Transformer for PcaTransformer {
         })?;
         let transformed = self.model.transform(vectors).map_err(|error| {
             let message = error.to_string();
-            let row_id = message
-                .split_once("row=")
-                .and_then(|(_, suffix)| suffix.split_once(','))
-                .and_then(|(row, _)| row.parse::<usize>().ok())
-                .and_then(|row| {
-                    batch
-                        .column_by_name(ROW_ID)
-                        .and_then(|row_ids| row_ids.as_primitive_opt::<UInt64Type>())
-                        .filter(|row_ids| row < row_ids.len() && row_ids.is_valid(row))
-                        .map(|row_ids| row_ids.value(row))
-                });
+            let row_id = non_finite_output(&error).and_then(|failure| {
+                let row = failure.row;
+                batch
+                    .column_by_name(ROW_ID)
+                    .and_then(|row_ids| row_ids.as_primitive_opt::<UInt64Type>())
+                    .filter(|row_ids| row < row_ids.len() && row_ids.is_valid(row))
+                    .map(|row_ids| row_ids.value(row))
+            });
             match row_id {
                 Some(row_id) => Error::invalid_input(format!(
                     "PCA Transform: column {}, row_id={row_id}: {message}",
