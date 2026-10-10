@@ -15,7 +15,7 @@ use crate::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
         },
-        vector_index_details, vector_index_details_default,
+        vector_index_details, vector_index_details_default, vector_index_details_with_pca,
     },
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -552,7 +552,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     (files, None)
                 };
                 CreatedIndex {
-                    index_details: vector_index_details(vec_params, pca_fingerprint)?,
+                    index_details: vector_index_details_with_pca(vec_params, pca_fingerprint)?,
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -3627,7 +3627,7 @@ mod tests {
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params, None).unwrap()),
+                    Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
                     vec![],
@@ -3653,7 +3653,7 @@ mod tests {
                     Uuid::new_v4(),
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params, None).unwrap()),
+                    Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
                     vec![],

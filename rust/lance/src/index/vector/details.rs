@@ -100,11 +100,56 @@ enum CompressionDetailsJson {
     },
 }
 
-/// Build a `VectorIndexDetails` proto from build params at index creation time.
-pub fn vector_index_details(
-    params: &VectorIndexParams,
+fn pca_parameters(
+    params: Option<&PcaParams>,
     model_fingerprint: Option<[u8; 32]>,
-) -> Result<prost_types::Any> {
+) -> Result<Option<PcaParameters>> {
+    match (params, model_fingerprint) {
+        (Some(params), Some(model_fingerprint)) => {
+            if params.dimension == 0 {
+                return Err(Error::invalid_input(
+                    "pca.dimension=0 must be greater than 0".to_string(),
+                ));
+            }
+            Ok(Some(PcaParameters {
+                dimension: u32::try_from(params.dimension).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "pca.dimension={} does not fit in u32",
+                        params.dimension
+                    ))
+                })?,
+                random_rotation: params.random_rotation,
+                whitening: params.whitening,
+                epsilon: params.epsilon,
+                sample_size: u32::try_from(params.sample_size).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "pca.sample_size={} does not fit in u32",
+                        params.sample_size
+                    ))
+                })?,
+                max_training_memory_bytes: u64::try_from(params.max_training_memory_bytes)
+                    .map_err(|_| {
+                        Error::invalid_input(format!(
+                            "pca.max_training_memory_bytes={} does not fit in u64",
+                            params.max_training_memory_bytes
+                        ))
+                    })?,
+                sampling_seed: params.sampling_seed,
+                rotation_seed: params.rotation_seed,
+                model_fingerprint: model_fingerprint.to_vec(),
+            }))
+        }
+        (Some(_), None) => Err(Error::invalid_input(
+            "PCA parameters require a trained model fingerprint".to_string(),
+        )),
+        (None, Some(_)) => Err(Error::invalid_input(
+            "a PCA model fingerprint requires PCA parameters".to_string(),
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+fn vector_index_details_proto(params: &VectorIndexParams) -> VectorIndexDetails {
     let metric_type = match params.metric_type {
         lance_linalg::distance::DistanceType::L2 => VectorMetricType::L2,
         lance_linalg::distance::DistanceType::Cosine => VectorMetricType::Cosine,
@@ -176,62 +221,29 @@ pub fn vector_index_details(
     );
 
     let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
-    let pca = match (params.pca_params(), model_fingerprint) {
-        (Some(params), Some(model_fingerprint)) => {
-            if params.dimension == 0 {
-                return Err(Error::invalid_input(
-                    "pca.dimension=0 must be greater than 0".to_string(),
-                ));
-            }
-            Some(PcaParameters {
-                dimension: u32::try_from(params.dimension).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "pca.dimension={} does not fit in u32",
-                        params.dimension
-                    ))
-                })?,
-                random_rotation: params.random_rotation,
-                whitening: params.whitening,
-                epsilon: params.epsilon,
-                sample_size: u32::try_from(params.sample_size).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "pca.sample_size={} does not fit in u32",
-                        params.sample_size
-                    ))
-                })?,
-                max_training_memory_bytes: u64::try_from(params.max_training_memory_bytes)
-                    .map_err(|_| {
-                        Error::invalid_input(format!(
-                            "pca.max_training_memory_bytes={} does not fit in u64",
-                            params.max_training_memory_bytes
-                        ))
-                    })?,
-                sampling_seed: params.sampling_seed,
-                rotation_seed: params.rotation_seed,
-                model_fingerprint: model_fingerprint.to_vec(),
-            })
-        }
-        (Some(_), None) => {
-            return Err(Error::invalid_input(
-                "PCA parameters require a trained model fingerprint".to_string(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(Error::invalid_input(
-                "a PCA model fingerprint requires PCA parameters".to_string(),
-            ));
-        }
-        (None, None) => None,
-    };
 
-    let details = VectorIndexDetails {
+    VectorIndexDetails {
         metric_type: metric_type.into(),
         target_partition_size,
         hnsw_index_config,
         compression,
         runtime_hints,
-        pca,
-    };
+        pca: None,
+    }
+}
+
+/// Build a `VectorIndexDetails` proto from build params at index creation time.
+pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
+    prost_types::Any::from_msg(&vector_index_details_proto(params)).unwrap()
+}
+
+/// Same as [`vector_index_details`], attaching the trained PCA model fingerprint.
+pub fn vector_index_details_with_pca(
+    params: &VectorIndexParams,
+    model_fingerprint: Option<[u8; 32]>,
+) -> Result<prost_types::Any> {
+    let mut details = vector_index_details_proto(params);
+    details.pca = pca_parameters(params.pca_params(), model_fingerprint)?;
     prost_types::Any::from_msg(&details)
         .map_err(|e| Error::index(format!("Failed to serialize VectorIndexDetails: {e}")))
 }
@@ -1144,7 +1156,7 @@ mod tests {
         )
         .with_pca(expected_params.clone());
 
-        let details = vector_index_details(&params, Some(fingerprint)).unwrap();
+        let details = vector_index_details_with_pca(&params, Some(fingerprint)).unwrap();
         let (actual_params, actual_fingerprint) =
             pca_params_from_details(&details).unwrap().unwrap();
         assert_eq!(actual_params, expected_params);
@@ -1159,7 +1171,7 @@ mod tests {
         let params =
             VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::default())
                 .with_pca(pca_params());
-        let error = vector_index_details(&params, None).unwrap_err();
+        let error = vector_index_details_with_pca(&params, None).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1168,7 +1180,7 @@ mod tests {
 
         let params =
             VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::default());
-        let error = vector_index_details(&params, Some([0; 32])).unwrap_err();
+        let error = vector_index_details_with_pca(&params, Some([0; 32])).unwrap_err();
         assert!(error.to_string().contains("requires PCA parameters"));
     }
 
@@ -1447,7 +1459,7 @@ mod tests {
             },
         );
 
-        let any = vector_index_details(&params, None).unwrap();
+        let any = vector_index_details(&params);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details
@@ -1563,7 +1575,7 @@ mod tests {
         );
         params.skip_transpose = true;
 
-        let any = vector_index_details(&params, None).unwrap();
+        let any = vector_index_details(&params);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1616,7 +1628,7 @@ mod tests {
         };
         let params = VectorIndexParams::ivf_hnsw(DistanceType::L2, IvfBuildParams::default(), hnsw);
 
-        let any = vector_index_details(&params, None).unwrap();
+        let any = vector_index_details(&params);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1654,7 +1666,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let any = vector_index_details(&params, None).unwrap();
+        let any = vector_index_details(&params);
         let json = vector_details_as_json(&any).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["runtime_hints"]["lance.ivf.max_iters"], "100");
@@ -1749,7 +1761,7 @@ mod tests {
 
         let params = build_roundtrip_params(combo, metric);
 
-        let any = vector_index_details(&params, None).unwrap();
+        let any = vector_index_details(&params);
         let restored = vector_params_from_details(&any)
             .expect("non-empty details should round-trip to params");
 
