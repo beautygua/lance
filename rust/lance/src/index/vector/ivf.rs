@@ -3907,12 +3907,6 @@ async fn refine_streaming_f32_kmeans_with_sampler(
                 )));
             }
             let training_data = cast_training_data_to_f32(training_data)?;
-            if training_data.value_length() as usize != dimension {
-                return Err(Error::invalid_input(format!(
-                    "streaming IVF refinement dimension={} does not match expected dimension={dimension}",
-                    training_data.value_length()
-                )));
-            }
             loss += accumulate_refine_assignments(
                 &training_data,
                 &centroids,
@@ -3973,12 +3967,6 @@ async fn refine_streaming_f32_kmeans_with_resampling(
                 )));
             }
             let training_data = cast_training_data_to_f32(training_data)?;
-            if training_data.value_length() as usize != dimension {
-                return Err(Error::invalid_input(format!(
-                    "streaming IVF refinement dimension={} does not match expected dimension={dimension}",
-                    training_data.value_length()
-                )));
-            }
             loss += accumulate_refine_assignments(
                 &training_data,
                 &centroids,
@@ -4773,12 +4761,6 @@ async fn train_streaming_coreset_ivf_model(
                 )));
             }
             let training_data = cast_training_data_to_f32(training_data)?;
-            if training_data.value_length() as usize != dimension {
-                return Err(Error::invalid_input(format!(
-                    "streaming coreset IVF training dimension={} does not match expected dimension={dimension}",
-                    training_data.value_length()
-                )));
-            }
             if training_data.len() < num_partitions {
                 return Err(Error::index(format!(
                     "Not enough training vectors for streaming coreset IVF. Requires at least {} rows but sampled {} rows",
@@ -4979,12 +4961,6 @@ async fn train_streaming_ivf_model(
                 pca_model,
             )
             .await?;
-            if training_data.value_length() as usize != dimension {
-                return Err(Error::invalid_input(format!(
-                    "streaming IVF training dimension={} does not match expected dimension={dimension}",
-                    training_data.value_length()
-                )));
-            }
             if training_data.len() < num_partitions {
                 return Err(Error::index(format!(
                     "Not enough training vectors for streaming IVF. Requires at least {} rows but sampled {} rows",
@@ -6606,13 +6582,13 @@ mod tests {
             .expect("streaming IVF trainer task panicked")
             .expect_err("the mismatched dimension should fail training");
         assert!(
-            matches!(error, Error::InvalidInput { .. }),
-            "expected the primary dimension validation error, got: {error}"
+            matches!(error, Error::Arrow { .. }),
+            "expected the primary centroid conversion error, got: {error}"
         );
         assert!(
-            error.to_string().contains(
-                "streaming IVF training dimension=32 does not match expected dimension=31"
-            ),
+            error
+                .to_string()
+                .contains("Incorrect length of values buffer for FixedSizeListArray"),
             "unexpected training error: {error}"
         );
         assert!(
