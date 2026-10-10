@@ -256,6 +256,62 @@ fn vectors_as_f64(vectors: &FixedSizeListArray, expected_dimension: usize) -> Re
     Ok(converted)
 }
 
+/// Builds a full IVF_RQ index with a PCA pre-transform.
+///
+/// Kept off the shared vector-index builder so non-PCA builds keep the original
+/// `build_vector_index` signature and control flow.
+pub(super) async fn build_pca_ivf_rq_index(
+    dataset: &Dataset,
+    column: &str,
+    uuid: uuid::Uuid,
+    params: &super::VectorIndexParams,
+    frag_reuse_index: Option<Arc<lance_index::frag_reuse::CompactFragReuseIndex>>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<super::builder::VectorIndexBuildSummary> {
+    let (vector_type, _) = super::utils::get_vector_type(dataset.schema(), column)?;
+    let input_dimension = get_vector_dim(dataset.schema(), column)?;
+    super::validate_pca_build_supported(params, &vector_type, input_dimension, None, false)?;
+    let pca_params = params.pca_params().cloned().ok_or_else(|| {
+        Error::invalid_input("PCA IVF_RQ build requires PCA parameters".to_string())
+    })?;
+    let (_element_type, _index_type, ivf_params, shuffler, _temp_dir) =
+        super::prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build PCA IVF_RQ",
+            false,
+            None,
+        )
+        .await?;
+    let super::StageParams::RQ(rq_params) = &params.stages[1] else {
+        return Err(Error::index(
+            "PCA IVF_RQ requires RQ as the second stage".to_string(),
+        ));
+    };
+
+    super::builder::IvfIndexBuilder::<
+        lance_index::vector::flat::index::FlatIndex,
+        lance_index::vector::bq::builder::RabitQuantizer,
+    >::new(
+        dataset.clone(),
+        column.to_owned(),
+        dataset.indices_dir().join(uuid.to_string()),
+        params.metric_type,
+        shuffler,
+        Some(ivf_params),
+        Some(rq_params.clone()),
+        (),
+        frag_reuse_index,
+    )?
+    .with_pca_params(pca_params)
+    .with_transpose(!params.skip_transpose)
+    .with_progress(progress)
+    .build()
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

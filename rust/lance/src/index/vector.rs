@@ -14,6 +14,7 @@ pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
 mod pca;
+pub(crate) use pca::build_pca_ivf_rq_index;
 pub mod pq;
 mod training_source;
 pub mod utils;
@@ -599,7 +600,6 @@ async fn prepare_vector_segment_build(
     }
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
-    let input_dimension = utils::get_vector_dim(dataset.schema(), column)?;
     if let DataType::List(_) = vector_type
         && params.metric_type != DistanceType::Cosine
     {
@@ -609,7 +609,6 @@ async fn prepare_vector_segment_build(
     }
 
     let index_type = params.index_type();
-    validate_pca_build_supported(params, &vector_type, input_dimension, fragment_ids, false)?;
     if index_type == IndexType::IvfRq {
         let Some(StageParams::RQ(rq_params)) = stages.last() else {
             return Err(Error::index(format!(
@@ -1118,7 +1117,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<VectorIndexBuildSummary> {
+) -> Result<Vec<IndexFile>> {
     build_vector_index_impl(
         dataset,
         column,
@@ -1144,7 +1143,7 @@ pub(crate) async fn build_filtered_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
-    Ok(build_vector_index_impl(
+    build_vector_index_impl(
         dataset,
         column,
         name,
@@ -1154,8 +1153,7 @@ pub(crate) async fn build_filtered_vector_index(
         progress,
         Some(fragment_ids),
     )
-    .await?
-    .files)
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1168,7 +1166,7 @@ async fn build_vector_index_impl(
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
-) -> Result<VectorIndexBuildSummary> {
+) -> Result<Vec<IndexFile>> {
     let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
         prepare_vector_segment_build(
             dataset,
@@ -1200,7 +1198,7 @@ async fn build_vector_index_impl(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-                Ok(summary)
+                Ok(summary.files)
             }
             DataType::UInt8 => {
                 let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
@@ -1218,7 +1216,7 @@ async fn build_vector_index_impl(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-                Ok(summary)
+                Ok(summary.files)
             }
             _ => Err(Error::index(format!(
                 "Build Vector Index: invalid data type: {:?}",
@@ -1253,11 +1251,7 @@ async fn build_vector_index_impl(
                         progress.clone(),
                     )
                     .await?;
-                    Ok(VectorIndexBuildSummary {
-                        indices_merged: 0,
-                        files,
-                        pca_fingerprint: None,
-                    })
+                    Ok(files)
                 }
                 IndexFileVersion::V3 => {
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
@@ -1278,7 +1272,7 @@ async fn build_vector_index_impl(
                         .with_progress(progress.clone())
                         .build()
                         .await?;
-                    Ok(summary)
+                    Ok(summary.files)
                 }
             }
         }
@@ -1305,7 +1299,7 @@ async fn build_vector_index_impl(
             .with_progress(progress.clone())
             .build()
             .await?;
-            Ok(summary)
+            Ok(summary.files)
         }
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
@@ -1315,7 +1309,7 @@ async fn build_vector_index_impl(
                 )));
             };
 
-            let mut builder = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+            let builder = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().join(uuid.to_string()),
@@ -1327,16 +1321,13 @@ async fn build_vector_index_impl(
                 frag_reuse_index,
             )?;
 
-            if let Some(pca_params) = params.pre_transform.clone() {
-                builder.with_pca_params(pca_params);
-            }
             let summary = builder
                 .with_transpose(!params.skip_transpose)
                 .with_optional_fragment_filter(fragment_ids)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-            Ok(summary)
+            Ok(summary.files)
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1362,7 +1353,7 @@ async fn build_vector_index_impl(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
-                    Ok(summary)
+                    Ok(summary.files)
                 }
                 _ => {
                     let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
@@ -1380,7 +1371,7 @@ async fn build_vector_index_impl(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
-                    Ok(summary)
+                    Ok(summary.files)
                 }
             }
         }
@@ -1412,7 +1403,7 @@ async fn build_vector_index_impl(
             .with_progress(progress.clone())
             .build()
             .await?;
-            Ok(summary)
+            Ok(summary.files)
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1442,7 +1433,7 @@ async fn build_vector_index_impl(
             .with_progress(progress.clone())
             .build()
             .await?;
-            Ok(summary)
+            Ok(summary.files)
         }
         _ => Err(Error::index(format!(
             "Build Vector Index: invalid index type: {:?}",
@@ -4244,10 +4235,9 @@ mod tests {
         let params = VectorIndexParams::ivf_rq(2, 1, DistanceType::L2)
             .with_pca(PcaParams::new(8).with_sample_size(64));
 
-        let summary = build_vector_index(
+        let summary = pca::build_pca_ivf_rq_index(
             &dataset,
             "vector",
-            "pca_ivf_rq",
             Uuid::new_v4(),
             &params,
             None,

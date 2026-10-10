@@ -13,7 +13,8 @@ use crate::{
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
-            build_empty_vector_index, build_filtered_vector_index, build_vector_index,
+            build_empty_vector_index, build_filtered_vector_index, build_pca_ivf_rq_index,
+            build_vector_index,
         },
         vector_index_details, vector_index_details_default, vector_index_details_with_pca,
     },
@@ -492,7 +493,23 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let (files, pca_fingerprint) = if train {
+                let (files, pca_fingerprint) = if vec_params.pca_params().is_some() {
+                    if !train || effective_fragments.is_some() {
+                        return Err(Error::not_supported(
+                            "PCA IVF_RQ is only supported for a full new local build".to_string(),
+                        ));
+                    }
+                    let summary = Box::pin(build_pca_ivf_rq_index(
+                        self.dataset,
+                        column,
+                        index_id,
+                        vec_params,
+                        fri,
+                        self.progress.clone(),
+                    ))
+                    .await?;
+                    (summary.files, summary.pca_fingerprint)
+                } else if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
                         if vector_params_have_precomputed_ivf(vec_params) {
@@ -527,7 +544,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         }
                     } else {
                         // Standard full dataset indexing
-                        let summary = Box::pin(build_vector_index(
+                        let files = Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -537,7 +554,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             self.progress.clone(),
                         ))
                         .await?;
-                        (summary.files, summary.pca_fingerprint)
+                        (files, None)
                     }
                 } else {
                     // Create empty vector index
