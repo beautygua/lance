@@ -5276,7 +5276,7 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
-    params.pre_transform = pca_params;
+    params.pre_transform = pca_params.map(lance::index::vector::PreTransformParams::Pca);
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?
     {

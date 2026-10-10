@@ -262,13 +262,22 @@ impl IndexFileVersion {
     }
 }
 
+/// Vector pre-transform applied before IVF and quantization.
+///
+/// New transforms are additional variants. Callers that only understand PCA
+/// use [`VectorIndexParams::pca_params`].
+#[derive(Debug, Clone)]
+pub enum PreTransformParams {
+    Pca(PcaParams),
+}
+
 /// The parameters to build vector index.
 #[derive(Debug, Clone)]
 pub struct VectorIndexParams {
     pub stages: Vec<StageParams>,
 
     /// Optional vector pre-transform applied before all index stages.
-    pub pre_transform: Option<PcaParams>,
+    pub pre_transform: Option<PreTransformParams>,
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
@@ -527,13 +536,16 @@ impl VectorIndexParams {
     /// assert_eq!(params.pca_params().map(|p| p.dimension), Some(32));
     /// ```
     pub fn with_pca(mut self, params: PcaParams) -> Self {
-        self.pre_transform = Some(params);
+        self.pre_transform = Some(PreTransformParams::Pca(params));
         self
     }
 
     /// Returns the configured PCA pre-transform parameters, if present.
     pub fn pca_params(&self) -> Option<&PcaParams> {
-        self.pre_transform.as_ref()
+        match self.pre_transform.as_ref() {
+            Some(PreTransformParams::Pca(params)) => Some(params),
+            None => None,
+        }
     }
 
     /// Returns the manifest compatibility version required by these parameters.
