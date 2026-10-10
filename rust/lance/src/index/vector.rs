@@ -1321,7 +1321,7 @@ async fn build_vector_index_impl(
                 )));
             };
 
-            let builder = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().join(uuid.to_string()),

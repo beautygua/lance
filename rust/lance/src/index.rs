@@ -75,7 +75,9 @@ use vector::details::{
     derive_vector_index_type, infer_missing_vector_details, needs_vector_details_inference,
     pca_params_from_details, vector_details_as_json,
 };
-pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
+pub(crate) use vector::details::{
+    vector_index_details, vector_index_details_default, vector_index_details_with_pca,
+};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox, read_pca_model_from_file};
 use vector::utils::{get_vector_type, infer_vector_dim};
 
@@ -4158,6 +4160,7 @@ mod tests {
         IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: Vec::new(),
             name: "pca_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,

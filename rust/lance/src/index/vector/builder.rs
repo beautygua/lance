@@ -33,7 +33,7 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions as file_versions;
-use lance_file::writer::FileWriterOptions;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;

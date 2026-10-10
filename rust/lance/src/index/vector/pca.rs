@@ -260,7 +260,7 @@ fn vectors_as_f64(vectors: &FixedSizeListArray, expected_dimension: usize) -> Re
 ///
 /// Kept off the shared vector-index builder so non-PCA builds keep the original
 /// `build_vector_index` signature and control flow.
-pub(super) async fn build_pca_ivf_rq_index(
+pub(crate) async fn build_pca_ivf_rq_index(
     dataset: &Dataset,
     column: &str,
     uuid: uuid::Uuid,
