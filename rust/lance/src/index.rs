@@ -1191,42 +1191,47 @@ fn validate_pca_shape(
     centroid_type: &DataType,
     rq_rotated_dimension: usize,
 ) -> Result<()> {
-    if model.input_dimension() != expected_input_dimension {
-        return Err(Error::corrupt_file_named(
-            INDEX_FILE_NAME,
-            format!(
-                "index_version={index_version} PCA input_dimension actual={} expected={expected_input_dimension} from dataset field",
-                model.input_dimension()
-            ),
-        ));
+    match crate::index::vector::pca_component_mismatch(
+        model,
+        expected_input_dimension,
+        ivf_dimension,
+        centroid_type,
+        rq_rotated_dimension,
+    ) {
+        None => Ok(()),
+        Some(crate::index::vector::PcaComponentMismatch::InputDimension { actual, expected }) => {
+            Err(Error::corrupt_file_named(
+                INDEX_FILE_NAME,
+                format!(
+                    "index_version={index_version} PCA input_dimension actual={actual} expected={expected} from dataset field"
+                ),
+            ))
+        }
+        Some(crate::index::vector::PcaComponentMismatch::CentroidType { actual }) => {
+            Err(Error::corrupt_file_named(
+                INDEX_FILE_NAME,
+                format!(
+                    "index_version={index_version} IVF centroid dtype actual={actual} expected=Float32"
+                ),
+            ))
+        }
+        Some(crate::index::vector::PcaComponentMismatch::OutputDimension { actual, expected }) => {
+            Err(Error::corrupt_file_named(
+                INDEX_FILE_NAME,
+                format!(
+                    "index_version={index_version} PCA output_dimension actual={actual} expected={expected} from IVF centroids"
+                ),
+            ))
+        }
+        Some(crate::index::vector::PcaComponentMismatch::RqDimension { actual, expected }) => {
+            Err(Error::corrupt_file_named(
+                INDEX_FILE_NAME,
+                format!(
+                    "index_version={index_version} RQ metadata rotated_dim actual={actual} expected={expected} from PCA output_dimension"
+                ),
+            ))
+        }
     }
-    if centroid_type != &DataType::Float32 {
-        return Err(Error::corrupt_file_named(
-            INDEX_FILE_NAME,
-            format!(
-                "index_version={index_version} IVF centroid dtype actual={centroid_type} expected=Float32"
-            ),
-        ));
-    }
-    if model.output_dimension() != ivf_dimension {
-        return Err(Error::corrupt_file_named(
-            INDEX_FILE_NAME,
-            format!(
-                "index_version={index_version} PCA output_dimension actual={} expected={ivf_dimension} from IVF centroids",
-                model.output_dimension()
-            ),
-        ));
-    }
-    if rq_rotated_dimension != model.output_dimension() {
-        return Err(Error::corrupt_file_named(
-            INDEX_FILE_NAME,
-            format!(
-                "index_version={index_version} RQ metadata rotated_dim actual={rq_rotated_dimension} expected={} from PCA output_dimension",
-                model.output_dimension()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_logical_pca_fingerprints<'a>(

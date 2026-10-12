@@ -1778,11 +1778,7 @@ pub async fn build_ivf_model_with_pca(
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
     let pca_source = if let Some(model) = pca_model {
-        if metric_type != MetricType::L2 {
-            return Err(Error::invalid_input(format!(
-                "PCA IVF training requires L2 distance, got {metric_type}"
-            )));
-        }
+        ensure_pca_training_l2(metric_type)?;
         if centroids.is_some() {
             return Err(Error::invalid_input(
                 "PCA IVF training does not support precomputed centroids".to_string(),
@@ -3319,6 +3315,16 @@ async fn sample_ivf_training_chunk(
     maybe_apply_pca_to_training_chunk(filter_finite_training_data(training_data)?, mt, pca_model)
 }
 
+fn ensure_pca_training_l2(metric_type: MetricType) -> Result<()> {
+    if metric_type == MetricType::L2 {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(format!(
+            "PCA IVF training requires L2 distance, got {metric_type}"
+        )))
+    }
+}
+
 fn maybe_apply_pca_to_training_chunk(
     training_data: FixedSizeListArray,
     metric_type: MetricType,
@@ -3327,11 +3333,7 @@ fn maybe_apply_pca_to_training_chunk(
     let Some(model) = pca_model else {
         return Ok((training_data, metric_type));
     };
-    if metric_type != MetricType::L2 {
-        return Err(Error::invalid_input(format!(
-            "PCA IVF training requires L2 distance, got {metric_type}"
-        )));
-    }
+    ensure_pca_training_l2(metric_type)?;
     if model.input_dimension() != training_data.value_length() as usize {
         return Err(Error::invalid_input(format!(
             "PCA input_dimension={} does not match streaming training vector dimension={}",

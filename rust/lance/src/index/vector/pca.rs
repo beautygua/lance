@@ -20,6 +20,47 @@ use crate::{Error, Result};
 
 const PCA_TRAINING_BATCH_SIZE: usize = 4096;
 
+/// Shared PCA / IVF / RQ shape comparison used by both writers and readers.
+pub(crate) enum PcaComponentMismatch {
+    InputDimension { actual: usize, expected: usize },
+    CentroidType { actual: DataType },
+    OutputDimension { actual: usize, expected: usize },
+    RqDimension { actual: usize, expected: usize },
+}
+
+pub(crate) fn pca_component_mismatch(
+    model: &PcaModel,
+    expected_input_dimension: usize,
+    ivf_dimension: usize,
+    centroid_type: &DataType,
+    rq_rotated_dimension: usize,
+) -> Option<PcaComponentMismatch> {
+    if model.input_dimension() != expected_input_dimension {
+        return Some(PcaComponentMismatch::InputDimension {
+            actual: model.input_dimension(),
+            expected: expected_input_dimension,
+        });
+    }
+    if centroid_type != &DataType::Float32 {
+        return Some(PcaComponentMismatch::CentroidType {
+            actual: centroid_type.clone(),
+        });
+    }
+    if model.output_dimension() != ivf_dimension {
+        return Some(PcaComponentMismatch::OutputDimension {
+            actual: model.output_dimension(),
+            expected: ivf_dimension,
+        });
+    }
+    if rq_rotated_dimension != model.output_dimension() {
+        return Some(PcaComponentMismatch::RqDimension {
+            actual: rq_rotated_dimension,
+            expected: model.output_dimension(),
+        });
+    }
+    None
+}
+
 /// Trains a PCA model from bounded, repeatable dataset reads.
 #[derive(Debug)]
 pub(super) struct PcaTrainer {

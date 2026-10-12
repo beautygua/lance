@@ -421,35 +421,36 @@ fn validate_pca_writer_shape(
             "PCA pre-transform requires Rabit quantizer, actual={quantization_type}"
         )));
     }
-    if model.input_dimension() != expected_input_dimension {
-        return Err(Error::invalid_input(format!(
-            "PCA input_dimension actual={} expected={expected_input_dimension} from dataset column",
-            model.input_dimension()
-        )));
-    }
     let centroids = ivf
         .centroids_array()
         .ok_or_else(|| Error::invalid_input("PCA pre-transform requires IVF centroids"))?;
-    if centroids.value_type() != DataType::Float32 {
-        return Err(Error::invalid_input(format!(
-            "IVF centroid dtype actual={} expected=Float32 for PCA pre-transform",
-            centroids.value_type()
-        )));
+    match super::pca_component_mismatch(
+        model,
+        expected_input_dimension,
+        ivf.dimension(),
+        &centroids.value_type(),
+        rq_rotated_dimension,
+    ) {
+        None => Ok(()),
+        Some(super::PcaComponentMismatch::InputDimension { actual, expected }) => {
+            Err(Error::invalid_input(format!(
+                "PCA input_dimension actual={actual} expected={expected} from dataset column"
+            )))
+        }
+        Some(super::PcaComponentMismatch::CentroidType { actual }) => Err(Error::invalid_input(
+            format!("IVF centroid dtype actual={actual} expected=Float32 for PCA pre-transform"),
+        )),
+        Some(super::PcaComponentMismatch::OutputDimension { actual, expected }) => {
+            Err(Error::invalid_input(format!(
+                "PCA output_dimension actual={actual} expected={expected} from IVF centroids"
+            )))
+        }
+        Some(super::PcaComponentMismatch::RqDimension { actual, expected }) => {
+            Err(Error::invalid_input(format!(
+                "RQ metadata rotated_dim actual={actual} expected={expected} from PCA output_dimension"
+            )))
+        }
     }
-    let expected_output_dimension = ivf.dimension();
-    if model.output_dimension() != expected_output_dimension {
-        return Err(Error::invalid_input(format!(
-            "PCA output_dimension actual={} expected={expected_output_dimension} from IVF centroids",
-            model.output_dimension()
-        )));
-    }
-    if rq_rotated_dimension != model.output_dimension() {
-        return Err(Error::invalid_input(format!(
-            "RQ metadata rotated_dim actual={rq_rotated_dimension} expected={} from PCA output_dimension",
-            model.output_dimension()
-        )));
-    }
-    Ok(())
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
