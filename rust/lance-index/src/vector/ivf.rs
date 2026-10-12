@@ -20,13 +20,12 @@ use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitio
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
 
 use super::flat::transform::FlatTransformer;
-use super::pca::PcaModel;
 use super::pq::transform::PQTransformer;
 use super::quantizer::Quantization;
 use super::residual::ResidualTransform;
 use super::sq::ScalarQuantizer;
 use super::sq::transform::SQTransformer;
-use super::transform::{KeepFiniteVectors, PcaTransformer};
+use super::transform::KeepFiniteVectors;
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 use super::{quantizer::Quantizer, residual::compute_residual};
 
@@ -59,7 +58,7 @@ pub fn new_ivf_transformer_with_quantizer(
     quantizer: Quantizer,
     range: Option<Range<u32>>,
 ) -> Result<IvfTransformer> {
-    new_ivf_transformer_with_quantizer_and_pca(
+    new_ivf_transformer_with_pre_transform(
         centroids,
         metric_type,
         vector_column,
@@ -69,23 +68,23 @@ pub fn new_ivf_transformer_with_quantizer(
     )
 }
 
-/// Creates an IVF transform chain with an optional trained PCA model.
+/// Creates an IVF transform chain with an optional vector pre-transform.
 ///
-/// `pca_model` projects the vector column after invalid vectors are removed
-/// and before partition assignment. PCA preprocessing is supported only for
-/// RQ quantization; passing it with another quantizer returns
-/// [`Error::NotSupported`].
-pub fn new_ivf_transformer_with_quantizer_and_pca(
+/// `pre_transform` rewrites the vector column after invalid vectors are
+/// removed and before partition assignment, so `centroids` must live in its
+/// output space. Pre-transforms are supported only for RQ quantization;
+/// passing one with another quantizer returns [`Error::NotSupported`].
+pub fn new_ivf_transformer_with_pre_transform(
     centroids: FixedSizeListArray,
     metric_type: MetricType,
     vector_column: &str,
     quantizer: Quantizer,
     range: Option<Range<u32>>,
-    pca_model: Option<Arc<PcaModel>>,
+    pre_transform: Option<Arc<dyn Transformer>>,
 ) -> Result<IvfTransformer> {
-    if pca_model.is_some() && !matches!(&quantizer, Quantizer::Rabit(_)) {
+    if pre_transform.is_some() && !matches!(&quantizer, Quantizer::Rabit(_)) {
         return Err(Error::not_supported(
-            "PCA preprocessing is only supported for RQ quantization",
+            "vector pre-transforms are only supported for RQ quantization",
         ));
     }
     match quantizer {
@@ -110,7 +109,7 @@ pub fn new_ivf_transformer_with_quantizer_and_pca(
             range,
         )),
         Quantizer::Rabit(rq) => {
-            IvfTransformer::with_rq(centroids, metric_type, vector_column, rq, range, pca_model)
+            IvfTransformer::with_rq(centroids, metric_type, vector_column, rq, range, pre_transform)
         }
     }
 }
@@ -310,7 +309,7 @@ impl IvfTransformer {
         vector_column: &str,
         rq: RabitQuantizer,
         range: Option<Range<u32>>,
-        pca_model: Option<Arc<PcaModel>>,
+        pre_transform: Option<Arc<dyn Transformer>>,
     ) -> Result<Self> {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
@@ -324,8 +323,8 @@ impl IvfTransformer {
             distance_type
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
-        if let Some(pca_model) = pca_model {
-            transforms.push(Arc::new(PcaTransformer::new(pca_model, vector_column)));
+        if let Some(pre_transform) = pre_transform {
+            transforms.push(pre_transform);
         }
 
         let partition_transform = Arc::new(
@@ -407,7 +406,8 @@ mod tests {
 
     use crate::vector::bq::storage::RABIT_CODE_COLUMN;
     use crate::vector::flat::index::FlatQuantizer;
-    use crate::vector::pca::PcaParams;
+    use crate::vector::pca::{PcaModel, PcaParams};
+    use crate::vector::transform::PcaTransformer;
 
     fn train_pca() -> Arc<PcaModel> {
         let training = FixedSizeListArray::try_new_from_values(
@@ -430,13 +430,13 @@ mod tests {
         .unwrap();
         let centroids = pca_model.transform(&source_centroids).unwrap();
         let rq = RabitQuantizer::new::<arrow_array::types::Float32Type>(1, 1);
-        let transformer = new_ivf_transformer_with_quantizer_and_pca(
+        let transformer = new_ivf_transformer_with_pre_transform(
             centroids,
             MetricType::L2,
             "vector",
             Quantizer::Rabit(rq),
             None,
-            Some(pca_model),
+            Some(Arc::new(PcaTransformer::new(pca_model, "vector"))),
         )
         .unwrap();
         let vectors = FixedSizeListArray::try_new_from_values(
@@ -519,15 +519,15 @@ mod tests {
     fn test_pca_rejected_for_non_rq_quantizer() {
         let centroids =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0]), 1).unwrap();
-        let error = new_ivf_transformer_with_quantizer_and_pca(
+        let error = new_ivf_transformer_with_pre_transform(
             centroids,
             MetricType::L2,
             "vector",
             Quantizer::Flat(FlatQuantizer::new(1, MetricType::L2)),
             None,
-            Some(train_pca()),
+            Some(Arc::new(PcaTransformer::new(train_pca(), "vector"))),
         )
-        .expect_err("PCA should be rejected for non-RQ quantizers");
+        .expect_err("pre-transforms should be rejected for non-RQ quantizers");
 
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(

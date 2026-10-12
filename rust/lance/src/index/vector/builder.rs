@@ -49,7 +49,7 @@ use lance_index::vector::quantizer::{
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
-use lance_index::vector::transform::Flatten;
+use lance_index::vector::transform::{Flatten, PcaTransformer};
 use lance_index::vector::v3::shuffler::{
     DEFAULT_PARTITION_WINDOW_BYTES, EmptyReader, IvfShufflerReader, create_ivf_shuffler,
 };
@@ -577,32 +577,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     pub async fn build(&mut self) -> Result<VectorIndexBuildSummary> {
         let progress = self.progress.clone();
 
-        if let Some(pca_params) = self.pca_params.as_ref() {
-            if self.pca_model.is_some()
-                || self.ivf.is_some()
-                || self.quantizer.is_some()
-                || !self.existing_indices.is_empty()
-                || self.fragment_filter.is_some()
-                || self.shuffle_reader.is_some()
-                || self.shuffle_data_input.lock().unwrap().is_some()
-            {
-                return Err(Error::invalid_input(
-                    "PCA pre-transform is only supported for a full new dataset build",
-                ));
-            }
-            let dataset = self.dataset.as_ref().ok_or_else(|| {
-                Error::invalid_input("PCA pre-transform requires the source dataset")
-            })?;
-            let model = super::pca::PcaTrainer::new(
-                dataset.clone(),
-                self.column.clone(),
-                None,
-                progress.clone(),
-            )
-            .train_dataset(pca_params)
-            .await?;
-            self.pca_model = Some(Arc::new(model));
-        }
+        self.train_pre_transform().await?;
 
         // step 1. train IVF & quantizer
         let max_iters = self.ivf_params.as_ref().map(|p| p.max_iters as u64);
@@ -764,9 +739,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         "dataset not set before loading or building IVF",
                     ));
                 };
-                let dim = self.pca_model.as_deref().map_or_else(
+                let dim = self.training_pre_transform().map_or_else(
                     || utils::get_vector_dim(dataset.schema(), &self.column),
-                    |model| Ok(model.output_dimension()),
+                    |transform| Ok(transform.output_dimension()),
                 )?;
                 let ivf_params = self
                     .ivf_params
@@ -780,10 +755,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf_params,
                     super::IvfModelTrainingContext {
                         fragment_ids: self.fragment_filter.as_deref(),
-                        pre_transform: self
-                            .pca_model
-                            .as_deref()
-                            .map(|model| model as &dyn TrainingVectorTransform),
+                        pre_transform: self.training_pre_transform(),
                         progress: self.progress.clone(),
                     },
                 )
@@ -1010,13 +982,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let code_column = quantizer.column();
 
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_pca(
+            lance_index::vector::ivf::new_ivf_transformer_with_pre_transform(
                 ivf.centroids.clone().unwrap(),
                 self.distance_type,
                 &self.column,
                 quantizer.into(),
                 None,
-                self.pca_model.clone(),
+                self.ivf_pre_transformer(&self.column),
             )?,
         );
 
@@ -1719,7 +1691,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 "quantizer not set before merge partitions",
             ));
         };
-        self.validate_pca_model(ivf, &quantizer)?;
+        self.validate_pre_transform(ivf, &quantizer)?;
 
         let quantization_type = Q::quantization_type();
         let is_pq = quantization_type == QuantizationType::Product;
@@ -1965,11 +1937,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             S::metadata_key(),
             serde_json::to_string(&partition_index_metadata)?,
         );
-        if let Some(pca_model) = self.pca_model.as_deref() {
-            let mut adapter = PcaFileWriterAdapter(&mut index_writer);
-            let buffer_index = write_pca_model(&mut adapter, pca_model).await?;
-            index_writer.add_schema_metadata(PCA_METADATA_KEY, buffer_index.to_string());
-        }
+        self.write_pre_transform(&mut index_writer).await?;
 
         let storage_summary = storage_writer.finish().await?;
         let index_summary = index_writer.finish().await?;
@@ -1988,7 +1956,73 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ])
     }
 
-    fn validate_pca_model(&self, ivf: &IvfModel, quantizer: &Q) -> Result<()> {
+    /// Train the configured pre-transform before IVF training, which then
+    /// runs in its output space.
+    async fn train_pre_transform(&mut self) -> Result<()> {
+        let Some(pca_params) = self.pca_params.as_ref() else {
+            return Ok(());
+        };
+        if self.pca_model.is_some()
+            || self.ivf.is_some()
+            || self.quantizer.is_some()
+            || !self.existing_indices.is_empty()
+            || self.fragment_filter.is_some()
+            || self.shuffle_reader.is_some()
+            || self.shuffle_data_input.lock().unwrap().is_some()
+        {
+            return Err(Error::invalid_input(
+                "PCA pre-transform is only supported for a full new dataset build",
+            ));
+        }
+        let dataset = self
+            .dataset
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("PCA pre-transform requires the source dataset"))?;
+        let model = super::pca::PcaTrainer::new(
+            dataset.clone(),
+            self.column.clone(),
+            None,
+            self.progress.clone(),
+        )
+        .train_dataset(pca_params)
+        .await?;
+        self.pca_model = Some(Arc::new(model));
+        Ok(())
+    }
+
+    /// The trained pre-transform as seen by IVF training and partition
+    /// assignment.
+    fn training_pre_transform(&self) -> Option<&dyn TrainingVectorTransform> {
+        self.pca_model
+            .as_deref()
+            .map(|model| model as &dyn TrainingVectorTransform)
+    }
+
+    /// The trained pre-transform as a step of the IVF transform chain over
+    /// `column`.
+    fn ivf_pre_transformer(&self, column: &str) -> Option<Arc<dyn Transformer>> {
+        self.pca_model
+            .clone()
+            .map(|model| Arc::new(PcaTransformer::new(model, column)) as Arc<dyn Transformer>)
+    }
+
+    fn apply_pre_transform(&self, vectors: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+        match self.training_pre_transform() {
+            Some(transform) => transform.transform_vectors(vectors),
+            None => Ok(vectors.clone()),
+        }
+    }
+
+    async fn write_pre_transform(&self, index_writer: &mut FileWriter) -> Result<()> {
+        if let Some(pca_model) = self.pca_model.as_deref() {
+            let mut adapter = PcaFileWriterAdapter(&mut *index_writer);
+            let buffer_index = write_pca_model(&mut adapter, pca_model).await?;
+            index_writer.add_schema_metadata(PCA_METADATA_KEY, buffer_index.to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_pre_transform(&self, ivf: &IvfModel, quantizer: &Q) -> Result<()> {
         let Some(model) = self.pca_model.as_deref() else {
             return Ok(());
         };
@@ -2074,8 +2108,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     ) -> Result<FixedSizeListArray> {
         let source =
             DatasetVectorSource::new(dataset, &self.column, self.fragment_filter.as_deref());
-        if let Some(model) = self.pca_model.as_ref() {
-            PreTransformVectorSource::try_new(source, model.as_ref())?
+        if let Some(transform) = self.training_pre_transform() {
+            PreTransformVectorSource::try_new(source, transform)?
                 .sample(sample_size)
                 .await
         } else {
@@ -2339,13 +2373,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         .boxed();
 
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_pca(
+            lance_index::vector::ivf::new_ivf_transformer_with_pre_transform(
                 new_centroids.clone(),
                 self.distance_type,
                 &self.column,
                 quantizer.into(),
                 None,
-                self.pca_model.clone(),
+                self.ivf_pre_transformer(&self.column),
             )?,
         );
 
@@ -2438,10 +2472,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )))?
             .as_fixed_size_list()
             .clone();
-        match self.pca_model.as_deref() {
-            Some(model) => Ok(Some(model.transform(&vectors)?)),
-            None => Ok(Some(vectors)),
-        }
+        Ok(Some(self.apply_pre_transform(&vectors)?))
     }
 
     /// Train the centroids that split one partition `split.ways` ways. Only a
@@ -2785,8 +2816,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let mut chunks = Box::pin(regroup_by_bytes(fetched, JOIN_FETCH_BYTES));
                 while let Some(chunk) = chunks.try_next().await? {
                     let (row_ids, vectors) = self.flatten_raw_vectors(&chunk)?;
-                    let assignment_vectors =
-                        project_vectors_for_assignment(self.pca_model.as_deref(), &vectors)?;
+                    let assignment_vectors = self.apply_pre_transform(&vectors)?;
                     for start in (0..row_ids.len()).step_by(JOIN_VECTORS_PER_BATCH) {
                         let end = (start + JOIN_VECTORS_PER_BATCH).min(row_ids.len());
                         let mut assign_ops: BTreeMap<u32, Vec<AssignOp>> = BTreeMap::new();
@@ -2805,7 +2835,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 &partition_window
                             };
                             let (target, had_room) = choose_assignment_destination::<T>(
-                                self.pca_model.is_some(),
+                                self.training_pre_transform().is_some(),
                                 self.distance_type,
                                 &assignment_vector,
                                 window_ids,
@@ -2883,13 +2913,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_pca(
+        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_pre_transform(
             centroids.clone(),
             self.distance_type,
             vector_field.name().as_str(),
             quantizer.into(),
             None,
-            self.pca_model.clone(),
+            self.ivf_pre_transformer(vector_field.name()),
         )?;
         Ok((transformer, vector_field))
     }
@@ -3060,16 +3090,6 @@ where
         .filter(|&(i, _)| accept(candidate_ids.value(i)))
         .min_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| candidate_ids.value(i)))
-}
-
-fn project_vectors_for_assignment(
-    model: Option<&PcaModel>,
-    vectors: &FixedSizeListArray,
-) -> Result<FixedSizeListArray> {
-    match model {
-        Some(model) => model.transform(vectors),
-        None => Ok(vectors.clone()),
-    }
 }
 
 fn choose_assignment_destination<T: ArrowPrimitiveType>(
