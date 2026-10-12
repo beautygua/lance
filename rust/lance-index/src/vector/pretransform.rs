@@ -28,13 +28,16 @@ use crate::prefilter::PreFilter;
 use crate::{Index, IndexType};
 
 trait QueryPreTransform: Debug + Send + Sync {
+    /// Short name used in error messages, e.g. "PCA".
+    fn kind(&self) -> &'static str;
+
     fn transform(&self, key: &ArrayRef) -> Result<ArrayRef>;
 
     fn deep_size_of_children(&self, context: &mut Context) -> usize;
 
-    fn pca_model(&self) -> Option<&Arc<PcaModel>> {
-        None
-    }
+    /// Whether distances in the transformed space still bound the original
+    /// distances, so `lower_bound` / `upper_bound` remain meaningful.
+    fn preserves_distance_bounds(&self) -> bool;
 }
 
 #[derive(Debug)]
@@ -43,6 +46,10 @@ struct PcaQueryPreTransform {
 }
 
 impl QueryPreTransform for PcaQueryPreTransform {
+    fn kind(&self) -> &'static str {
+        "PCA"
+    }
+
     fn transform(&self, key: &ArrayRef) -> Result<ArrayRef> {
         self.model.transform_query(key.as_ref())
     }
@@ -51,8 +58,8 @@ impl QueryPreTransform for PcaQueryPreTransform {
         self.model.deep_size_of_children(context)
     }
 
-    fn pca_model(&self) -> Option<&Arc<PcaModel>> {
-        Some(&self.model)
+    fn preserves_distance_bounds(&self) -> bool {
+        false
     }
 }
 
@@ -78,12 +85,13 @@ impl PreTransformIndex {
     }
 
     fn transformed_query(&self, query: &Query) -> Result<Query> {
-        if self.transform.pca_model().is_some()
+        if !self.transform.preserves_distance_bounds()
             && (query.lower_bound.is_some() || query.upper_bound.is_some())
         {
-            return Err(Error::not_supported(
-                "PCA vector indices do not support lower_bound or upper_bound queries",
-            ));
+            return Err(Error::not_supported(format!(
+                "{} vector indices do not support lower_bound or upper_bound queries",
+                self.transform.kind()
+            )));
         }
         let mut transformed = query.clone();
         transformed.key = self.transform.transform(&query.key)?;
@@ -93,11 +101,6 @@ impl PreTransformIndex {
     /// Returns the wrapped index for cache reconstruction.
     pub fn inner(&self) -> &Arc<dyn VectorIndex> {
         &self.inner
-    }
-
-    /// Returns the PCA model used by this decorator.
-    pub fn pca_model(&self) -> Option<&Arc<PcaModel>> {
-        self.transform.pca_model()
     }
 }
 
@@ -361,6 +364,14 @@ mod tests {
     }
 
     impl QueryPreTransform for CountingTransform {
+        fn kind(&self) -> &'static str {
+            "counting"
+        }
+
+        fn preserves_distance_bounds(&self) -> bool {
+            true
+        }
+
         fn transform(&self, key: &ArrayRef) -> Result<ArrayRef> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let key = key
@@ -775,7 +786,6 @@ mod tests {
         assert!(index.supports_prepared_partition_search());
         assert_eq!(index.auto_query_parallelism(8), 7);
         assert!(index.open_io_stats().is_none());
-        assert!(index.pca_model().is_none());
 
         let batch_stream = index.to_batch_stream(true).await.unwrap();
         assert!(batch_stream.collect::<Vec<_>>().await.is_empty());
@@ -846,7 +856,7 @@ mod tests {
         let model = Arc::new(PcaModel::train(&training_data, &PcaParams::new(1)).unwrap());
         let index = PreTransformIndex::new_pca(Arc::new(MockVectorIndex::new()), model.clone());
 
-        assert!(Arc::ptr_eq(index.pca_model().unwrap(), &model));
+        assert_eq!(Arc::strong_count(&model), 2);
         let mut context = Context::new();
         assert!(index.deep_size_of_children(&mut context) > 0);
         assert_eq!(index.deep_size_of_children(&mut context), 0);
@@ -864,6 +874,7 @@ mod tests {
         let error = index.transformed_query(&query()).unwrap_err();
 
         assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("PCA vector indices"));
         assert!(error.to_string().contains("lower_bound or upper_bound"));
     }
 
