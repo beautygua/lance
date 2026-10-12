@@ -73,7 +73,7 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 use vector::details::{
     derive_vector_index_type, infer_missing_vector_details, needs_vector_details_inference,
-    pca_params_from_details, vector_details_as_json,
+    pca_params_from_details, pre_transform_blocks_maintenance, vector_details_as_json,
 };
 pub(crate) use vector::details::{
     vector_index_details, vector_index_details_default, vector_index_details_with_pca,
@@ -2235,10 +2235,10 @@ impl DatasetIndexExt for Dataset {
         if all_vector {
             for segment in source_segments.iter() {
                 if let Some(details) = segment.index_details.as_deref()
-                    && pca_params_from_details(details)?.is_some()
+                    && pre_transform_blocks_maintenance(details)?
                 {
                     return Err(Error::not_supported(
-                        "Merging PCA vector index segments is not supported",
+                        "Merging vector index segments with a pre-transform is not supported",
                     ));
                 }
             }

@@ -319,6 +319,12 @@ pub fn pca_params_from_details(
     )))
 }
 
+/// Whether persisted details describe a pre-transform that cannot be appended,
+/// optimized, or merged in place.
+pub fn pre_transform_blocks_maintenance(details: &prost_types::Any) -> Result<bool> {
+    Ok(pca_params_from_details(details)?.is_some())
+}
+
 /// Apply stored runtime hints from `VectorIndexDetails` back into build params.
 ///
 /// Known `lance.*` keys are parsed and applied to the appropriate stage. Unknown
