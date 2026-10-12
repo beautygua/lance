@@ -43,7 +43,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pca::PcaModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::{Quantization, Quantizer};
+use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
@@ -1074,15 +1074,6 @@ fn validate_pca_manifest_and_model(
     model: Option<&Arc<PcaModel>>,
 ) -> Result<()> {
     vector::validate_pca_manifest_and_model(index_meta, physical_index_type, model)
-}
-
-fn validate_pca_index_dimensions(
-    index_meta: &IndexMetadata,
-    model: Option<&Arc<PcaModel>>,
-    index: &Arc<dyn VectorIndex>,
-    expected_input_dimension: usize,
-) -> Result<()> {
-    vector::validate_pca_index_dimensions(index_meta, model, index, expected_input_dimension)
 }
 
 fn validate_pca_shape(

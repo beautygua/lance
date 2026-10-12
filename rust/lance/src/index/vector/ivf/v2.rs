@@ -45,7 +45,7 @@ use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
+use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::{IndexReader, RowIdRemapper};
 use lance_index::vector::VectorIndexCacheEntry;
