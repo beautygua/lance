@@ -77,7 +77,7 @@ use vector::details::{
 pub(crate) use vector::details::{
     vector_index_details, vector_index_details_default, vector_index_details_with_pca,
 };
-use vector::ivf::v2::{IVFIndex, IvfStateEntryBox, read_pca_model_from_file};
+use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
 use vector::utils::{get_vector_type, infer_vector_dim};
 
 mod api;
@@ -1025,22 +1025,22 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
     }
 }
 
-pub(crate) struct PcaIndexStateCacheKey<'a> {
+pub(crate) struct PreTransformIndexStateCacheKey<'a> {
     uuid: &'a Uuid,
     fri_uuid: Option<&'a Uuid>,
 }
 
-impl<'a> PcaIndexStateCacheKey<'a> {
+impl<'a> PreTransformIndexStateCacheKey<'a> {
     fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
 
-impl CacheKey for PcaIndexStateCacheKey<'_> {
-    type ValueType = vector::pca_load::PcaIndexState;
+impl CacheKey for PreTransformIndexStateCacheKey<'_> {
+    type ValueType = vector::pca_load::PreTransformIndexState;
 
     fn type_name() -> &'static str {
-        "PcaIndexState"
+        "PreTransformIndexState"
     }
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
@@ -1060,7 +1060,7 @@ impl CacheKey for PcaIndexStateCacheKey<'_> {
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
-        Some(lance_core::cache::CacheCodec::from_impl::<vector::pca_load::PcaIndexState>())
+        Some(lance_core::cache::CacheCodec::from_impl::<vector::pca_load::PreTransformIndexState>())
     }
 }
 
@@ -3047,7 +3047,7 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
 
         // Check sized cache for IvfIndexState (v2+ indices).
-        let pca_state_key = PcaIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let pca_state_key = PreTransformIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if self.index_cache.get_with_key(&pca_state_key).await.is_some() {
             let index = self.open_vector_index(column, uuid, metrics).await?;
             return Ok(index.as_index());
@@ -3138,11 +3138,11 @@ impl DatasetIndexInternalExt for Dataset {
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        let pca_state_key = PcaIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let pca_state_key = PreTransformIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if manifest_pca_metadata.is_some()
             && let Some(entry) = self.index_cache.get_with_key(&pca_state_key).await
         {
-            log::debug!("Found PcaIndexState in cache uuid: {}", uuid);
+            log::debug!("Found PreTransformIndexState in cache uuid: {}", uuid);
             validate_pca_manifest_and_model(&index_meta, None, Some(&entry.model))?;
             let (_, field) = resolve_index_column(self.schema(), &index_meta, column)?;
             let input_dimension = infer_vector_dim(&field.data_type())?;
@@ -3308,7 +3308,7 @@ impl DatasetIndexInternalExt for Dataset {
                 let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
-                let pca_model = read_pca_model_from_file(&reader).await?;
+                let pca_model = vector::pca_load::read_pre_transform(&reader).await?;
                 validate_pca_manifest_and_model(
                     &index_meta,
                     Some(&index_metadata.index_type),
@@ -3472,7 +3472,7 @@ impl DatasetIndexInternalExt for Dataset {
                         self.index_cache
                             .insert_with_key(
                                 &pca_state_key,
-                                Arc::new(vector::pca_load::PcaIndexState { inner, model }),
+                                Arc::new(vector::pca_load::PreTransformIndexState { inner, model }),
                             )
                             .await;
                     }

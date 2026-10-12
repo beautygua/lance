@@ -35,7 +35,6 @@ use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder, LanceCache, WeakLanceCache,
 };
-use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
@@ -47,7 +46,7 @@ use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::{IndexReader, RowIdRemapper};
+use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
@@ -57,7 +56,6 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pca::{PCA_METADATA_KEY, PcaModel, read_pca_model};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{
     QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
@@ -96,67 +94,6 @@ use uuid::Uuid;
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
-
-struct PcaFileReaderAdapter<'a> {
-    reader: &'a FileReader,
-    schema: LanceSchema,
-}
-
-impl<'a> PcaFileReaderAdapter<'a> {
-    fn new(reader: &'a FileReader) -> Result<Self> {
-        Ok(Self {
-            reader,
-            schema: reader.schema().as_ref().try_into()?,
-        })
-    }
-}
-
-#[async_trait]
-impl IndexReader for PcaFileReaderAdapter<'_> {
-    async fn read_record_batch(&self, _n: u64, _batch_size: u64) -> Result<RecordBatch> {
-        Err(Error::not_supported(
-            "PCA file-reader adapter does not read record batches",
-        ))
-    }
-
-    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
-        self.reader.read_global_buffer(index).await
-    }
-
-    async fn read_range(
-        &self,
-        _range: std::ops::Range<usize>,
-        _projection: Option<&[&str]>,
-    ) -> Result<RecordBatch> {
-        Err(Error::not_supported(
-            "PCA file-reader adapter does not read row ranges",
-        ))
-    }
-
-    async fn num_batches(&self, _batch_size: u64) -> u32 {
-        0
-    }
-
-    fn num_rows(&self) -> usize {
-        self.reader.metadata().num_rows as usize
-    }
-
-    fn schema(&self) -> &LanceSchema {
-        &self.schema
-    }
-}
-
-/// Loads the optional PCA model declared by an index file's schema metadata.
-pub(crate) async fn read_pca_model_from_file(reader: &FileReader) -> Result<Option<Arc<PcaModel>>> {
-    let Some(buffer_index) = reader.schema().metadata.get(PCA_METADATA_KEY) else {
-        return Ok(None);
-    };
-    let adapter = PcaFileReaderAdapter::new(reader)?;
-    read_pca_model(&adapter, buffer_index)
-        .await
-        .map(Arc::new)
-        .map(Some)
-}
 
 /// Serializable state of an IVF index, sufficient to reconstruct the index
 /// without re-reading global buffers from object storage.

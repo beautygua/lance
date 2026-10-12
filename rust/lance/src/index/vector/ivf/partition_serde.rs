@@ -1180,11 +1180,11 @@ mod tests {
         rewritten
     }
 
-    fn make_pca_state() -> crate::index::vector::pca_load::PcaIndexState {
+    fn make_pca_state() -> crate::index::vector::pca_load::PreTransformIndexState {
         use crate::index::vector::ivf::v2::IvfStateEntryBox;
-        use crate::index::vector::pca_load::PcaIndexState;
+        use crate::index::vector::pca_load::PreTransformIndexState;
 
-        PcaIndexState {
+        PreTransformIndexState {
             inner: IvfStateEntryBox(Arc::new(make_ivf_state())),
             model: make_pca_model(),
         }
@@ -1217,12 +1217,12 @@ mod tests {
 
     #[test]
     fn test_pca_index_state_roundtrip() {
-        use crate::index::vector::pca_load::PcaIndexState;
+        use crate::index::vector::pca_load::PreTransformIndexState;
 
         let pca = make_pca_model();
         assert!(pca.training_stats().is_some());
         let entry = make_pca_state();
-        let restored = de_body::<PcaIndexState>(ser_body(&entry)).unwrap();
+        let restored = de_body::<PreTransformIndexState>(ser_body(&entry)).unwrap();
 
         assert_eq!(restored.model.transform_matrix(), pca.transform_matrix());
         assert_eq!(restored.model.mean(), pca.mean());
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_pca_index_state_rejects_invalid_metadata() {
-        use crate::index::vector::pca_load::PcaIndexState;
+        use crate::index::vector::pca_load::PreTransformIndexState;
         use lance_index::vector::pca::encode_pca_model;
 
         let pca = make_pca_model();
@@ -1271,7 +1271,7 @@ mod tests {
         ];
 
         for (name, body, expected) in cases {
-            let Err(error) = de_body::<PcaIndexState>(body) else {
+            let Err(error) = de_body::<PreTransformIndexState>(body) else {
                 panic!("{name} should fail");
             };
             assert!(
@@ -1288,7 +1288,7 @@ mod tests {
 
     #[test]
     fn test_pca_index_state_rejects_missing_model_blob() {
-        use crate::index::vector::pca_load::PcaIndexState;
+        use crate::index::vector::pca_load::PreTransformIndexState;
 
         let valid = ser_body(&make_pca_state());
         let data = bytes::Bytes::from(valid);
@@ -1298,7 +1298,7 @@ mod tests {
         let mut writer = CacheEntryWriter::new(&mut rewritten);
         writer.write_header(&header).unwrap();
 
-        let Err(error) = de_body::<PcaIndexState>(rewritten) else {
+        let Err(error) = de_body::<PreTransformIndexState>(rewritten) else {
             panic!("missing PCA blob should fail");
         };
         let message = error.to_string();
@@ -1310,13 +1310,13 @@ mod tests {
     #[test]
     fn test_pca_index_state_deep_size_counts_shared_arc_once() {
         use crate::index::vector::ivf::v2::IvfStateEntryBox;
-        use crate::index::vector::pca_load::PcaIndexState;
+        use crate::index::vector::pca_load::PreTransformIndexState;
         use lance_core::deepsize::{Context, DeepSizeOf};
 
         let pca = make_pca_model();
         let inner = IvfStateEntryBox(Arc::new(make_ivf_state()));
         let without_size = inner.deep_size_of_children(&mut Context::new());
-        let with_pca = PcaIndexState {
+        let with_pca = PreTransformIndexState {
             inner: IvfStateEntryBox(Arc::new(make_ivf_state())),
             model: pca.clone(),
         };

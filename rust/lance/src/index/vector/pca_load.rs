@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Load-time checks for a PCA pre-transform.
+//! Reading, checking and caching a PCA pre-transform at index load time.
 
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_schema::DataType;
+use async_trait::async_trait;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::deepsize::DeepSizeOf;
+use lance_file::reader::FileReader;
 use lance_index::pb::PcaParameters;
+use lance_index::scalar::IndexReader;
 use lance_index::vector::VectorIndex;
-use lance_index::vector::pca::{PcaModel, decode_pca_model, encode_pca_model};
+use lance_index::vector::pca::{
+    PCA_METADATA_KEY, PcaModel, decode_pca_model, encode_pca_model, read_pca_model,
+};
 use lance_index::vector::pretransform::PreTransformIndex;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::{INDEX_FILE_NAME, IndexType};
@@ -21,6 +28,67 @@ use super::ivf::v2::IvfStateEntryBox;
 use super::details::{derive_vector_index_type, pca_params_from_details};
 use super::{PcaComponentMismatch, pca_component_mismatch};
 use crate::{Error, Result};
+
+struct PcaFileReaderAdapter<'a> {
+    reader: &'a FileReader,
+    schema: LanceSchema,
+}
+
+impl<'a> PcaFileReaderAdapter<'a> {
+    fn new(reader: &'a FileReader) -> Result<Self> {
+        Ok(Self {
+            reader,
+            schema: reader.schema().as_ref().try_into()?,
+        })
+    }
+}
+
+#[async_trait]
+impl IndexReader for PcaFileReaderAdapter<'_> {
+    async fn read_record_batch(&self, _n: u64, _batch_size: u64) -> Result<RecordBatch> {
+        Err(Error::not_supported(
+            "PCA file-reader adapter does not read record batches",
+        ))
+    }
+
+    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+        self.reader.read_global_buffer(index).await
+    }
+
+    async fn read_range(
+        &self,
+        _range: std::ops::Range<usize>,
+        _projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        Err(Error::not_supported(
+            "PCA file-reader adapter does not read row ranges",
+        ))
+    }
+
+    async fn num_batches(&self, _batch_size: u64) -> u32 {
+        0
+    }
+
+    fn num_rows(&self) -> usize {
+        self.reader.metadata().num_rows as usize
+    }
+
+    fn schema(&self) -> &LanceSchema {
+        &self.schema
+    }
+}
+
+/// Reads the optional pre-transform declared by an index file's schema metadata.
+pub(crate) async fn read_pre_transform(reader: &FileReader) -> Result<Option<Arc<PcaModel>>> {
+    let Some(buffer_index) = reader.schema().metadata.get(PCA_METADATA_KEY) else {
+        return Ok(None);
+    };
+    let adapter = PcaFileReaderAdapter::new(reader)?;
+    read_pca_model(&adapter, buffer_index)
+        .await
+        .map(Arc::new)
+        .map(Some)
+}
 
 pub(crate) fn format_pca_fingerprint(fingerprint: &[u8; 32]) -> String {
     fingerprint
@@ -272,18 +340,18 @@ pub(crate) fn attach_loaded_pre_transform(
 /// Cached IVF state plus the pre-transform that must be reattached on open.
 ///
 /// The IVF cache entry itself stays free of pre-transform bytes.
-pub(crate) struct PcaIndexState {
+pub(crate) struct PreTransformIndexState {
     pub(crate) inner: IvfStateEntryBox,
     pub(crate) model: Arc<PcaModel>,
 }
 
-impl DeepSizeOf for PcaIndexState {
+impl DeepSizeOf for PreTransformIndexState {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.inner.deep_size_of_children(context) + self.model.deep_size_of_children(context)
     }
 }
 
-impl CacheCodecImpl for PcaIndexState {
+impl CacheCodecImpl for PreTransformIndexState {
     const TYPE_ID: &'static str = "lance.vector.pretransform.PcaState";
     const CURRENT_VERSION: u32 = 1;
 
