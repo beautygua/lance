@@ -806,47 +806,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "loading training data for quantizer. sample size: {}",
             sample_size_hint
         );
-        let training_data = match self.pca_model.as_ref() {
-            Some(model) => {
-                let source = DatasetVectorSource::new(
-                    dataset,
-                    &self.column,
-                    self.fragment_filter.as_deref(),
-                );
-                PreTransformVectorSource::try_new(source, model.as_ref())?
-                    .sample(sample_size_hint)
-                    .await?
-            }
-            None => {
-                utils::maybe_sample_training_data(
-                    dataset,
-                    &self.column,
-                    sample_size_hint,
-                    self.fragment_filter.as_deref(),
-                )
-                .await?
-            }
-        };
+        let training_data = self
+            .sample_stage_training(dataset, sample_size_hint)
+            .await?;
         info!(
             "Finished loading training data in {:02} seconds",
             start.elapsed().as_secs_f32()
         );
-
-        // If metric type is cosine, normalize the training data, and after this point,
-        // treat the metric type as L2.
-        let training_data =
-            if self.pca_model.is_none() && self.distance_type == DistanceType::Cosine {
-                lance_linalg::kernels::normalize_fsl_owned(training_data)?
-            } else {
-                training_data
-            };
-
-        let training_data = if self.pca_model.is_none() {
-            // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-            utils::filter_finite_training_data(training_data)?
-        } else {
-            training_data
-        };
 
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
@@ -2094,6 +2060,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .buffered(prefetch.max(1)))
     }
 
+    async fn sample_stage_training(
+        &self,
+        dataset: &Dataset,
+        sample_size: usize,
+    ) -> Result<FixedSizeListArray> {
+        let source =
+            DatasetVectorSource::new(dataset, &self.column, self.fragment_filter.as_deref());
+        if let Some(model) = self.pca_model.as_ref() {
+            PreTransformVectorSource::try_new(source, model.as_ref())?
+                .sample(sample_size)
+                .await
+        } else {
+            source
+                .sample_for_distance(sample_size, self.distance_type)
+                .await
+        }
+    }
+
     /// A chunk of raw vectors flattened to one row id per vector (a multivector
     /// row contributes every one of its vectors).
     fn flatten_raw_vectors(
@@ -2794,10 +2778,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let mut chunks = Box::pin(regroup_by_bytes(fetched, JOIN_FETCH_BYTES));
                 while let Some(chunk) = chunks.try_next().await? {
                     let (row_ids, vectors) = self.flatten_raw_vectors(&chunk)?;
-                    let assignment_vectors = match self.pca_model.as_deref() {
-                        Some(model) => model.transform(&vectors)?,
-                        None => vectors.clone(),
-                    };
+                    let assignment_vectors =
+                        project_vectors_for_assignment(self.pca_model.as_deref(), &vectors)?;
                     for start in (0..row_ids.len()).step_by(JOIN_VECTORS_PER_BATCH) {
                         let end = (start + JOIN_VECTORS_PER_BATCH).min(row_ids.len());
                         let mut assign_ops: BTreeMap<u32, Vec<AssignOp>> = BTreeMap::new();
@@ -2815,27 +2797,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             } else {
                                 &partition_window
                             };
-                            let (target, had_room) = if self.pca_model.is_some() {
-                                choose_join_destination(
-                                    self.distance_type,
-                                    assignment_vector.as_primitive::<Float32Type>(),
-                                    window_ids,
-                                    window_centroids,
-                                    ivf,
-                                    removed,
-                                    room,
-                                )?
-                            } else {
-                                choose_join_destination(
-                                    self.distance_type,
-                                    assignment_vector.as_primitive::<T>(),
-                                    window_ids,
-                                    window_centroids,
-                                    ivf,
-                                    removed,
-                                    room,
-                                )?
-                            };
+                            let (target, had_room) = choose_assignment_destination::<T>(
+                                self.pca_model.is_some(),
+                                self.distance_type,
+                                &assignment_vector,
+                                window_ids,
+                                window_centroids,
+                                ivf,
+                                removed,
+                                room,
+                            )?;
                             if had_room {
                                 room[target as usize] -= 1;
                             } else {
@@ -3082,6 +3053,52 @@ where
         .filter(|&(i, _)| accept(candidate_ids.value(i)))
         .min_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| candidate_ids.value(i)))
+}
+
+fn project_vectors_for_assignment(
+    model: Option<&PcaModel>,
+    vectors: &FixedSizeListArray,
+) -> Result<FixedSizeListArray> {
+    match model {
+        Some(model) => model.transform(vectors),
+        None => Ok(vectors.clone()),
+    }
+}
+
+fn choose_assignment_destination<T: ArrowPrimitiveType>(
+    projected_f32: bool,
+    distance_type: DistanceType,
+    assignment_vector: &ArrayRef,
+    window_ids: &UInt32Array,
+    window_centroids: &FixedSizeListArray,
+    ivf: &IvfModel,
+    removed: &HashSet<usize>,
+    room: &[usize],
+) -> Result<(u32, bool)>
+where
+    T::Native: Dot + L2 + Normalize,
+{
+    if projected_f32 {
+        choose_join_destination(
+            distance_type,
+            assignment_vector.as_primitive::<Float32Type>(),
+            window_ids,
+            window_centroids,
+            ivf,
+            removed,
+            room,
+        )
+    } else {
+        choose_join_destination(
+            distance_type,
+            assignment_vector.as_primitive::<T>(),
+            window_ids,
+            window_centroids,
+            ivf,
+            removed,
+            room,
+        )
+    }
 }
 
 /// Where a row of a joined partition goes: the nearest of the `window` (the

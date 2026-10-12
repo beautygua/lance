@@ -5,6 +5,7 @@ use arrow_array::FixedSizeListArray;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::vector::pca::PcaModel;
+use lance_linalg::distance::DistanceType;
 
 use super::utils::{filter_finite_training_data, get_vector_dim, maybe_sample_training_data};
 use crate::Dataset;
@@ -35,6 +36,24 @@ impl<'a> DatasetVectorSource<'a> {
             column,
             fragment_ids,
         }
+    }
+
+    /// Samples like [`VectorTrainingDataSource::sample`], normalizing cosine
+    /// vectors before dropping non-finite rows.
+    pub(super) async fn sample_for_distance(
+        &self,
+        sample_size: usize,
+        distance_type: DistanceType,
+    ) -> Result<FixedSizeListArray> {
+        let training_data =
+            maybe_sample_training_data(self.dataset, self.column, sample_size, self.fragment_ids)
+                .await?;
+        let training_data = if distance_type == DistanceType::Cosine {
+            lance_linalg::kernels::normalize_fsl_owned(training_data)?
+        } else {
+            training_data
+        };
+        filter_finite_training_data(training_data)
     }
 }
 
