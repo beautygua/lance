@@ -1114,9 +1114,7 @@ mod tests {
         }
     }
 
-    fn make_ivf_state(
-        pca: Option<Arc<lance_index::vector::pca::PcaModel>>,
-    ) -> crate::index::vector::ivf::v2::IvfIndexState<FlatQuantizer> {
+    fn make_ivf_state() -> crate::index::vector::ivf::v2::IvfIndexState<FlatQuantizer> {
         use crate::index::vector::ivf::v2::{IvfIndexState, empty_rabit_search_cache_cell};
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::quantizer::QuantizationType;
@@ -1140,7 +1138,6 @@ mod tests {
             quantization_type: QuantizationType::Flat,
             index_file_size: 1024,
             aux_file_size: 512,
-            pca,
             rq_search_cache: empty_rabit_search_cache_cell(),
         }
     }
@@ -1155,62 +1152,62 @@ mod tests {
         Arc::new(PcaModel::train(&vectors, &PcaParams::new(2)).unwrap())
     }
 
-    fn deserialize_ivf_state_body(
-        bytes: Vec<u8>,
-        version: u32,
-    ) -> Result<crate::index::vector::ivf::v2::IvfStateEntryBox> {
-        use crate::index::vector::ivf::v2::IvfStateEntryBox;
-
-        let data = bytes::Bytes::from(bytes);
-        IvfStateEntryBox::deserialize(&mut CacheEntryReader::new(&data, 0, version))
-    }
-
-    fn rewrite_ivf_state_pca(
+    fn rewrite_pca_cache(
         body: Vec<u8>,
         fingerprint: Option<Vec<u8>>,
         pca_blob: Option<&[u8]>,
     ) -> Vec<u8> {
-        use lance_index::cache_pb::IvfStateHeader;
+        use lance_index::pb::PcaParameters;
 
         let data = bytes::Bytes::from(body);
-        let mut reader = CacheEntryReader::new(&data, 0, 2);
-        let mut header: IvfStateHeader = reader.read_header().unwrap();
-        let ivf = reader.read_raw().unwrap();
-        let extra = reader.read_raw().unwrap();
-        let aux_ivf = reader.read_raw().unwrap();
-        header.pca_fingerprint = fingerprint;
+        let mut reader = CacheEntryReader::new(&data, 0, 1);
+        let mut header: PcaParameters = reader.read_header().unwrap();
+        let _model = reader.read_raw().unwrap();
+        let inner = reader.read_raw().unwrap();
+        if let Some(fingerprint) = fingerprint {
+            header.model_fingerprint = fingerprint;
+        } else {
+            header.model_fingerprint.clear();
+        }
 
         let mut rewritten = Vec::new();
         let mut writer = CacheEntryWriter::new(&mut rewritten);
         writer.write_header(&header).unwrap();
-        writer.write_raw(&ivf).unwrap();
-        writer.write_raw(&extra).unwrap();
-        writer.write_raw(&aux_ivf).unwrap();
         if let Some(pca_blob) = pca_blob {
             writer.write_raw(pca_blob).unwrap();
         }
+        writer.write_raw(&inner).unwrap();
         rewritten
+    }
+
+    fn make_pca_state() -> crate::index::vector::pca_load::PcaIndexState {
+        use crate::index::vector::ivf::v2::IvfStateEntryBox;
+        use crate::index::vector::pca_load::PcaIndexState;
+
+        PcaIndexState {
+            inner: IvfStateEntryBox(Arc::new(make_ivf_state())),
+            model: make_pca_model(),
+        }
     }
 
     #[test]
     fn test_ivf_index_state_roundtrip_without_pca() {
         use crate::index::vector::ivf::v2::IvfStateEntryBox;
 
-        let state = make_ivf_state(None);
+        let state = make_ivf_state();
 
         let entry = IvfStateEntryBox(Arc::new(state));
 
         let bytes = ser_body(&entry);
         let restored = de_body::<IvfStateEntryBox>(bytes.clone()).unwrap();
-        assert!(restored.0.pca().is_none());
 
         let data = bytes::Bytes::from(bytes.clone());
-        let mut reader = CacheEntryReader::new(&data, 0, 2);
+        let mut reader = CacheEntryReader::new(&data, 0, 1);
         let _: lance_index::cache_pb::IvfStateHeader = reader.read_header().unwrap();
         reader.read_raw().unwrap();
         reader.read_raw().unwrap();
         reader.read_raw().unwrap();
-        assert!(reader.read_raw().unwrap().is_empty());
+        assert!(reader.read_raw().is_err());
 
         // Re-serialize the restored entry and compare bytes — a stronger check
         // than field-by-field comparison and avoids needing to downcast.
@@ -1219,60 +1216,47 @@ mod tests {
     }
 
     #[test]
-    fn test_ivf_index_state_roundtrip_with_pca() {
-        use crate::index::vector::ivf::v2::IvfStateEntryBox;
+    fn test_pca_index_state_roundtrip() {
+        use crate::index::vector::pca_load::PcaIndexState;
 
         let pca = make_pca_model();
         assert!(pca.training_stats().is_some());
-        let entry = IvfStateEntryBox(Arc::new(make_ivf_state(Some(pca.clone()))));
-        let restored = de_body::<IvfStateEntryBox>(ser_body(&entry)).unwrap();
-        let restored_pca = restored.0.pca().expect("PCA should round-trip");
+        let entry = make_pca_state();
+        let restored = de_body::<PcaIndexState>(ser_body(&entry)).unwrap();
 
-        assert_eq!(restored_pca.transform_matrix(), pca.transform_matrix());
-        assert_eq!(restored_pca.mean(), pca.mean());
-        assert_eq!(restored_pca.fingerprint(), pca.fingerprint());
-        assert!(restored_pca.training_stats().is_none());
+        assert_eq!(restored.model.transform_matrix(), pca.transform_matrix());
+        assert_eq!(restored.model.mean(), pca.mean());
+        assert_eq!(restored.model.fingerprint(), pca.fingerprint());
+        assert!(restored.model.training_stats().is_none());
     }
 
     #[test]
-    fn test_ivf_index_state_reads_legacy_v1_body() {
-        use crate::index::vector::ivf::v2::IvfStateEntryBox;
-
-        let current = ser_body(&IvfStateEntryBox(Arc::new(make_ivf_state(None))));
-        let legacy = rewrite_ivf_state_pca(current, None, None);
-        let restored = deserialize_ivf_state_body(legacy, 1).unwrap();
-        assert!(restored.0.pca().is_none());
-    }
-
-    #[test]
-    fn test_ivf_index_state_rejects_invalid_pca_metadata() {
-        use crate::index::vector::ivf::v2::IvfStateEntryBox;
+    fn test_pca_index_state_rejects_invalid_metadata() {
+        use crate::index::vector::pca_load::PcaIndexState;
         use lance_index::vector::pca::encode_pca_model;
 
         let pca = make_pca_model();
         let blob = encode_pca_model(&pca).unwrap();
-        let valid = ser_body(&IvfStateEntryBox(Arc::new(make_ivf_state(Some(
-            pca.clone(),
-        )))));
+        let valid = ser_body(&make_pca_state());
         let cases = [
             (
                 "missing fingerprint",
-                rewrite_ivf_state_pca(valid.clone(), None, Some(&blob)),
+                rewrite_pca_cache(valid.clone(), None, Some(&blob)),
                 "missing fingerprint",
             ),
             (
                 "short fingerprint",
-                rewrite_ivf_state_pca(valid.clone(), Some(vec![7; 31]), Some(&blob)),
+                rewrite_pca_cache(valid.clone(), Some(vec![7; 31]), Some(&blob)),
                 "fingerprint length mismatch",
             ),
             (
                 "mismatched fingerprint",
-                rewrite_ivf_state_pca(valid.clone(), Some(vec![7; 32]), Some(&blob)),
+                rewrite_pca_cache(valid.clone(), Some(vec![7; 32]), Some(&blob)),
                 "fingerprint mismatch",
             ),
             (
                 "malformed PCA protobuf",
-                rewrite_ivf_state_pca(
+                rewrite_pca_cache(
                     valid.clone(),
                     Some(pca.fingerprint().to_vec()),
                     Some(&[0xff, 0xff]),
@@ -1281,13 +1265,13 @@ mod tests {
             ),
             (
                 "fingerprint with empty blob",
-                rewrite_ivf_state_pca(valid, Some(pca.fingerprint().to_vec()), Some(&[])),
+                rewrite_pca_cache(valid, Some(pca.fingerprint().to_vec()), Some(&[])),
                 "empty blob has fingerprint",
             ),
         ];
 
         for (name, body, expected) in cases {
-            let Err(error) = deserialize_ivf_state_body(body, 2) else {
+            let Err(error) = de_body::<PcaIndexState>(body) else {
                 panic!("{name} should fail");
             };
             assert!(
@@ -1296,50 +1280,52 @@ mod tests {
             );
             let message = error.to_string();
             assert!(message.contains(expected), "{name}: {message}");
-            assert!(message.contains("version=2"), "{name}: {message}");
+            assert!(message.contains("version=1"), "{name}: {message}");
             assert!(message.contains("blob_len="), "{name}: {message}");
             assert!(message.contains("fingerprint"), "{name}: {message}");
         }
     }
 
     #[test]
-    fn test_ivf_index_state_rejects_missing_or_truncated_pca_blob() {
-        use crate::index::vector::ivf::v2::IvfStateEntryBox;
+    fn test_pca_index_state_rejects_missing_model_blob() {
+        use crate::index::vector::pca_load::PcaIndexState;
 
-        let valid = ser_body(&IvfStateEntryBox(Arc::new(make_ivf_state(None))));
-        let missing = rewrite_ivf_state_pca(valid.clone(), None, None);
-        let mut truncated = rewrite_ivf_state_pca(valid, None, Some(&[]));
-        truncated.pop();
+        let valid = ser_body(&make_pca_state());
+        let data = bytes::Bytes::from(valid);
+        let mut reader = CacheEntryReader::new(&data, 0, 1);
+        let header: lance_index::pb::PcaParameters = reader.read_header().unwrap();
+        let mut rewritten = Vec::new();
+        let mut writer = CacheEntryWriter::new(&mut rewritten);
+        writer.write_header(&header).unwrap();
 
-        for (name, body) in [("missing", missing), ("truncated", truncated)] {
-            let Err(error) = deserialize_ivf_state_body(body, 2) else {
-                panic!("{name} PCA blob should fail");
-            };
-            assert!(matches!(&error, Error::IO { .. }));
-            let message = error.to_string();
-            assert!(message.contains("PCA blob read failed"), "{message}");
-            assert!(message.contains("version=2"), "{message}");
-            assert!(message.contains("fingerprint"), "{message}");
-        }
+        let Err(error) = de_body::<PcaIndexState>(rewritten) else {
+            panic!("missing PCA blob should fail");
+        };
+        let message = error.to_string();
+        assert!(message.contains("model blob read failed"), "{message}");
+        assert!(message.contains("version=1"), "{message}");
+        assert!(message.contains("fingerprint"), "{message}");
     }
 
     #[test]
-    fn test_ivf_index_state_pca_deep_size_counts_shared_arc_once() {
+    fn test_pca_index_state_deep_size_counts_shared_arc_once() {
+        use crate::index::vector::ivf::v2::IvfStateEntryBox;
+        use crate::index::vector::pca_load::PcaIndexState;
         use lance_core::deepsize::{Context, DeepSizeOf};
 
         let pca = make_pca_model();
-        let without_pca = make_ivf_state(None);
-        let with_pca = make_ivf_state(Some(pca.clone()));
-
-        let without_size = without_pca.deep_size_of_children(&mut Context::new());
+        let inner = IvfStateEntryBox(Arc::new(make_ivf_state()));
+        let without_size = inner.deep_size_of_children(&mut Context::new());
+        let with_pca = PcaIndexState {
+            inner: IvfStateEntryBox(Arc::new(make_ivf_state())),
+            model: pca.clone(),
+        };
         let with_size = with_pca.deep_size_of_children(&mut Context::new());
         assert!(with_size > without_size);
 
         let mut shared_context = Context::new();
         assert!(pca.deep_size_of_children(&mut shared_context) > 0);
-        assert_eq!(
-            with_pca.deep_size_of_children(&mut shared_context),
-            without_size
-        );
+        let with_shared = with_pca.deep_size_of_children(&mut shared_context);
+        assert!(with_shared < with_size);
     }
 }

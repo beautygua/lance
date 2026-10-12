@@ -6,12 +6,17 @@
 use std::sync::Arc;
 
 use arrow_schema::DataType;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+use lance_core::deepsize::DeepSizeOf;
+use lance_index::pb::PcaParameters;
 use lance_index::vector::VectorIndex;
-use lance_index::vector::pca::PcaModel;
+use lance_index::vector::pca::{PcaModel, decode_pca_model, encode_pca_model};
 use lance_index::vector::pretransform::PreTransformIndex;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::{INDEX_FILE_NAME, IndexType};
 use lance_table::format::IndexMetadata;
+
+use super::ivf::v2::IvfStateEntryBox;
 
 use super::details::{derive_vector_index_type, pca_params_from_details};
 use super::{PcaComponentMismatch, pca_component_mismatch};
@@ -262,4 +267,101 @@ pub(crate) fn attach_loaded_pre_transform(
     };
     validate_pca_index_dimensions(index_meta, model, &index, input_dimension)?;
     Ok(index)
+}
+
+/// Cached IVF state plus the pre-transform that must be reattached on open.
+///
+/// The IVF cache entry itself stays free of pre-transform bytes.
+pub(crate) struct PcaIndexState {
+    pub(crate) inner: IvfStateEntryBox,
+    pub(crate) model: Arc<PcaModel>,
+}
+
+impl DeepSizeOf for PcaIndexState {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context) + self.model.deep_size_of_children(context)
+    }
+}
+
+impl CacheCodecImpl for PcaIndexState {
+    const TYPE_ID: &'static str = "lance.vector.pretransform.PcaState";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let header = PcaParameters {
+            dimension: u32::try_from(self.model.output_dimension()).map_err(|_| {
+                Error::io(format!(
+                    "PCA cache output_dimension={} does not fit in u32",
+                    self.model.output_dimension()
+                ))
+            })?,
+            model_fingerprint: self.model.fingerprint().to_vec(),
+            ..Default::default()
+        };
+        let model_bytes = encode_pca_model(self.model.as_ref())?;
+        let mut inner_bytes = Vec::new();
+        self.inner
+            .serialize(&mut CacheEntryWriter::new(&mut inner_bytes))?;
+        w.write_header(&header)?;
+        w.write_raw(&model_bytes)?;
+        w.write_raw(&inner_bytes)?;
+        Ok(())
+    }
+
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let version = r.version();
+        let header: PcaParameters = r.read_header()?;
+        let model_bytes = r.read_raw().map_err(|error| {
+            Error::io(format!(
+                "PCA cache model blob read failed: version={version}, blob_len=unavailable, fingerprint={:?}: {error}",
+                header.model_fingerprint
+            ))
+        })?;
+        let blob_len = model_bytes.len();
+        let fingerprint = header.model_fingerprint.as_slice();
+        if fingerprint.is_empty() {
+            return Err(Error::io(format!(
+                "PCA cache metadata mismatch: version={version}, blob_len={blob_len}, fingerprint=None: non-empty blob is missing fingerprint"
+            )));
+        }
+        if fingerprint.len() != 32 {
+            return Err(Error::io(format!(
+                "PCA cache fingerprint length mismatch: version={version}, blob_len={blob_len}, fingerprint_len={}, fingerprint={fingerprint:?}, expected=32",
+                fingerprint.len()
+            )));
+        }
+        if model_bytes.is_empty() {
+            return Err(Error::io(format!(
+                "PCA cache metadata mismatch: version={version}, blob_len={blob_len}, fingerprint_len={}, fingerprint={fingerprint:?}: empty blob has fingerprint",
+                fingerprint.len()
+            )));
+        }
+        let model = decode_pca_model(&model_bytes).map_err(|error| {
+            Error::io(format!(
+                "PCA cache PCA decode failed: version={version}, blob_len={blob_len}, fingerprint_len={}, fingerprint={fingerprint:?}: {error}",
+                fingerprint.len()
+            ))
+        })?;
+        let actual_fingerprint = model.fingerprint();
+        if fingerprint != actual_fingerprint.as_slice() {
+            return Err(Error::io(format!(
+                "PCA cache fingerprint mismatch: version={version}, blob_len={blob_len}, fingerprint_len={}, expected={fingerprint:?}, actual={actual_fingerprint:?}",
+                fingerprint.len()
+            )));
+        }
+        let inner_bytes = r.read_raw().map_err(|error| {
+            Error::io(format!(
+                "PCA cache inner IVF blob read failed: version={version}, fingerprint={fingerprint:?}: {error}"
+            ))
+        })?;
+        let inner = IvfStateEntryBox::deserialize(&mut CacheEntryReader::new(
+            &inner_bytes,
+            0,
+            IvfStateEntryBox::CURRENT_VERSION,
+        ))?;
+        Ok(Self {
+            inner,
+            model: Arc::new(model),
+        })
+    }
 }

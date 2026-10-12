@@ -14,7 +14,7 @@ pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
 mod pca;
-mod pca_load;
+pub(crate) mod pca_load;
 pub(crate) use pca::build_pca_ivf_rq_index;
 pub(crate) use pca::{PcaComponentMismatch, pca_component_mismatch};
 pub(crate) use pca_load::{

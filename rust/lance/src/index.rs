@@ -1025,8 +1025,43 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
     }
 }
 
-fn format_pca_fingerprint(fingerprint: &[u8; 32]) -> String {
-    vector::format_pca_fingerprint(fingerprint)
+pub(crate) struct PcaIndexStateCacheKey<'a> {
+    uuid: &'a Uuid,
+    fri_uuid: Option<&'a Uuid>,
+}
+
+impl<'a> PcaIndexStateCacheKey<'a> {
+    fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
+        Self { uuid, fri_uuid }
+    }
+}
+
+impl CacheKey for PcaIndexStateCacheKey<'_> {
+    type ValueType = vector::pca_load::PcaIndexState;
+
+    fn type_name() -> &'static str {
+        "PcaIndexState"
+    }
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("pca-{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            format!("pca-{}", self.uuid).into()
+        }
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.pca-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
+
+    fn codec() -> Option<lance_core::cache::CacheCodec> {
+        Some(lance_core::cache::CacheCodec::from_impl::<vector::pca_load::PcaIndexState>())
+    }
 }
 
 fn manifest_pca(index_meta: &IndexMetadata) -> Result<Option<(usize, [u8; 32])>> {
@@ -3021,6 +3056,11 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
 
         // Check sized cache for IvfIndexState (v2+ indices).
+        let pca_state_key = PcaIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if self.index_cache.get_with_key(&pca_state_key).await.is_some() {
+            let index = self.open_vector_index(column, uuid, metrics).await?;
+            return Ok(index.as_index());
+        }
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if self.index_cache.get_with_key(&state_key).await.is_some() {
             // Reconstruct via open_vector_index which will hit the same sized key.
@@ -3107,19 +3147,41 @@ impl DatasetIndexInternalExt for Dataset {
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
-            log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            let pca_model = entry.0.pca().cloned();
-            validate_pca_manifest_and_model(&index_meta, None, pca_model.as_ref())?;
-            let input_dimension = if pca_model.is_some() {
-                let (_, field) = resolve_index_column(self.schema(), &index_meta, column)?;
-                infer_vector_dim(&field.data_type())?
-            } else {
-                0
-            };
+        let pca_state_key = PcaIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if manifest_pca_metadata.is_some()
+            && let Some(entry) = self.index_cache.get_with_key(&pca_state_key).await
+        {
+            log::debug!("Found PcaIndexState in cache uuid: {}", uuid);
+            validate_pca_manifest_and_model(&index_meta, None, Some(&entry.model))?;
+            let (_, field) = resolve_index_column(self.schema(), &index_meta, column)?;
+            let input_dimension = infer_vector_dim(&field.data_type())?;
             let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             let index = entry
+                .inner
+                .0
+                .reconstruct(
+                    object_store.clone(),
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
+                .await?;
+            return vector::attach_loaded_pre_transform(
+                index,
+                Some(&entry.model),
+                &index_meta,
+                input_dimension,
+            );
+        }
+        if manifest_pca_metadata.is_none()
+            && let Some(entry) = self.index_cache.get_with_key(&state_key).await
+        {
+            log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
+            validate_pca_manifest_and_model(&index_meta, None, None)?;
+            let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+            return entry
                 .0
                 .reconstruct(
                     object_store,
@@ -3127,14 +3189,7 @@ impl DatasetIndexInternalExt for Dataset {
                     partition_cache,
                     frag_reuse_index,
                 )
-                .await?;
-            validate_pca_index_dimensions(
-                &index_meta,
-                pca_model.as_ref(),
-                &index,
-                input_dimension,
-            )?;
-            return Ok(index);
+                .await;
         }
 
         // Fallback: in-memory cache for legacy indices.
@@ -3181,18 +3236,9 @@ impl DatasetIndexInternalExt for Dataset {
         // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
         fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
             ivf: IVFIndex<S, Q>,
-            pca_model: Option<Arc<PcaModel>>,
-            index_meta: &IndexMetadata,
-            input_dimension: usize,
         ) -> Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> {
-            let entry = ivf.to_state_entry(pca_model.clone());
-            let index = vector::attach_loaded_pre_transform(
-                Arc::new(ivf),
-                pca_model.as_ref(),
-                index_meta,
-                input_dimension,
-            )?;
-            Ok((index, Some(entry)))
+            let entry = ivf.to_state_entry();
+            Ok((Arc::new(ivf), Some(entry)))
         }
 
         // the index file is in lance format since version (0,2)
@@ -3285,7 +3331,7 @@ impl DatasetIndexInternalExt for Dataset {
 
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
-                match index_metadata.index_type.as_str() {
+                let loaded = match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
@@ -3298,7 +3344,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                            wrap_ivf(ivf)
                         }
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
@@ -3311,7 +3357,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                            wrap_ivf(ivf)
                         }
                         _ => Err(Error::index(format!(
                             "the field type {} is not supported for FLAT index",
@@ -3330,7 +3376,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                        wrap_ivf(ivf)
                     }
 
                     "IVF_SQ" => {
@@ -3344,7 +3390,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                        wrap_ivf(ivf)
                     }
 
                     "IVF_RQ" => {
@@ -3358,7 +3404,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                        wrap_ivf(ivf)
                     }
 
                     "IVF_HNSW_FLAT" => match element_type {
@@ -3373,7 +3419,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                            wrap_ivf(ivf)
                         }
                         _ => {
                             let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
@@ -3386,7 +3432,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                            wrap_ivf(ivf)
                         }
                     },
 
@@ -3401,7 +3447,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                        wrap_ivf(ivf)
                     }
 
                     "IVF_HNSW_PQ" => {
@@ -3415,13 +3461,33 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf, pca_model.clone(), &index_meta, input_dimension)
+                        wrap_ivf(ivf)
                     }
 
                     _ => Err(Error::index(format!(
                         "Unsupported index type: {}",
                         index_metadata.index_type
                     ))),
+                }?;
+                let (index, ivf_entry) = loaded;
+                if let Some(model) = pca_model {
+                    let index = vector::attach_loaded_pre_transform(
+                        index,
+                        Some(&model),
+                        &index_meta,
+                        input_dimension,
+                    )?;
+                    if let Some(inner) = ivf_entry {
+                        self.index_cache
+                            .insert_with_key(
+                                &pca_state_key,
+                                Arc::new(vector::pca_load::PcaIndexState { inner, model }),
+                            )
+                            .await;
+                    }
+                    Ok((index, None))
+                } else {
+                    Ok((index, ivf_entry))
                 }
             }
 
@@ -3444,7 +3510,7 @@ impl DatasetIndexInternalExt for Dataset {
             self.index_cache
                 .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;
-        } else {
+        } else if manifest_pca_metadata.is_none() {
             self.index_cache
                 .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
                 .await;
