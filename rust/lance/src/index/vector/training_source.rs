@@ -10,7 +10,29 @@ use lance_linalg::distance::DistanceType;
 use super::utils::{filter_finite_training_data, get_vector_dim, maybe_sample_training_data};
 use crate::Dataset;
 
-/// Training vectors for IVF/RQ. PCA wraps a raw source so downstream stages only see the reduced dimension.
+/// A trained pre-transform as seen by IVF training and partition assignment.
+pub(crate) trait TrainingVectorTransform: Send + Sync {
+    fn input_dimension(&self) -> usize;
+    fn output_dimension(&self) -> usize;
+    /// Maps original-space vectors to Float32 vectors of `output_dimension`.
+    fn transform_vectors(&self, vectors: &FixedSizeListArray) -> Result<FixedSizeListArray>;
+}
+
+impl TrainingVectorTransform for PcaModel {
+    fn input_dimension(&self) -> usize {
+        PcaModel::input_dimension(self)
+    }
+
+    fn output_dimension(&self) -> usize {
+        PcaModel::output_dimension(self)
+    }
+
+    fn transform_vectors(&self, vectors: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+        self.transform(vectors)
+    }
+}
+
+/// Training vectors for IVF/RQ. A pre-transform wraps a raw source so downstream stages only see the reduced dimension.
 #[async_trait]
 pub(super) trait VectorTrainingDataSource: Send + Sync {
     async fn sample(&self, sample_size: usize) -> Result<FixedSizeListArray>;
@@ -71,34 +93,34 @@ impl VectorTrainingDataSource for DatasetVectorSource<'_> {
     }
 }
 
-/// Applies a trained PCA model to another source's samples.
+/// Applies a trained pre-transform to another source's samples.
 pub(super) struct PreTransformVectorSource<'a, S> {
     source: S,
-    model: &'a PcaModel,
+    transform: &'a dyn TrainingVectorTransform,
 }
 
 impl<'a, S: VectorTrainingDataSource> PreTransformVectorSource<'a, S> {
-    pub(super) fn try_new(source: S, model: &'a PcaModel) -> Result<Self> {
+    pub(super) fn try_new(source: S, transform: &'a dyn TrainingVectorTransform) -> Result<Self> {
         let source_dimension = source.dimension()?;
-        if model.input_dimension() != source_dimension {
+        if transform.input_dimension() != source_dimension {
             return Err(Error::invalid_input(format!(
-                "PCA input_dimension={} does not match source vector dimension={source_dimension}",
-                model.input_dimension()
+                "pre-transform input_dimension={} does not match source vector dimension={source_dimension}",
+                transform.input_dimension()
             )));
         }
-        Ok(Self { source, model })
+        Ok(Self { source, transform })
     }
 }
 
 #[async_trait]
 impl<S: VectorTrainingDataSource> VectorTrainingDataSource for PreTransformVectorSource<'_, S> {
     async fn sample(&self, sample_size: usize) -> Result<FixedSizeListArray> {
-        self.model
-            .transform(&self.source.sample(sample_size).await?)
+        self.transform
+            .transform_vectors(&self.source.sample(sample_size).await?)
     }
 
     fn dimension(&self) -> Result<usize> {
-        Ok(self.model.output_dimension())
+        Ok(self.transform.output_dimension())
     }
 }
 

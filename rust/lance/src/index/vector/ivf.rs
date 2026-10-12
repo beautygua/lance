@@ -7,7 +7,10 @@ use super::details::target_partition_size_from_details;
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
-    training_source::{DatasetVectorSource, PreTransformVectorSource, VectorTrainingDataSource},
+    training_source::{
+        DatasetVectorSource, PreTransformVectorSource, TrainingVectorTransform,
+        VectorTrainingDataSource,
+    },
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
@@ -78,6 +81,7 @@ use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams};
+#[cfg(test)]
 use lance_index::vector::pca::PcaModel;
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
@@ -1741,7 +1745,7 @@ pub async fn build_ivf_model(
     fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
-    build_ivf_model_with_pca(
+    build_ivf_model_with_context(
         dataset,
         column,
         dim,
@@ -1749,20 +1753,20 @@ pub async fn build_ivf_model(
         params,
         IvfModelTrainingContext {
             fragment_ids,
-            pca_model: None,
+            pre_transform: None,
             progress,
         },
     )
     .await
 }
 
-pub struct IvfModelTrainingContext<'a> {
-    pub fragment_ids: Option<&'a [u32]>,
-    pub pca_model: Option<&'a PcaModel>,
-    pub progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+pub(crate) struct IvfModelTrainingContext<'a> {
+    pub(crate) fragment_ids: Option<&'a [u32]>,
+    pub(crate) pre_transform: Option<&'a dyn TrainingVectorTransform>,
+    pub(crate) progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 }
 
-pub async fn build_ivf_model_with_pca(
+pub(crate) async fn build_ivf_model_with_context(
     dataset: &Dataset,
     column: &str,
     dim: usize,
@@ -1772,25 +1776,25 @@ pub async fn build_ivf_model_with_pca(
 ) -> Result<IvfModel> {
     let IvfModelTrainingContext {
         fragment_ids,
-        pca_model,
+        pre_transform,
         progress,
     } = context;
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
-    let pca_source = if let Some(model) = pca_model {
-        ensure_pca_training_l2(metric_type)?;
+    let pre_transform_source = if let Some(transform) = pre_transform {
+        ensure_pre_transform_training_l2(metric_type)?;
         if centroids.is_some() {
             return Err(Error::invalid_input(
-                "PCA IVF training does not support precomputed centroids".to_string(),
+                "pre-transform IVF training does not support precomputed centroids".to_string(),
             ));
         }
         let source = PreTransformVectorSource::try_new(
             DatasetVectorSource::new(dataset, column, fragment_ids),
-            model,
+            transform,
         )?;
         if source.dimension()? != dim {
             return Err(Error::invalid_input(format!(
-                "PCA output_dimension={} does not match IVF training dimension={dim}",
+                "pre-transform output_dimension={} does not match IVF training dimension={dim}",
                 source.dimension()?
             )));
         }
@@ -1844,7 +1848,7 @@ pub async fn build_ivf_model_with_pca(
                 metric_type,
                 params,
                 fragment_ids,
-                pca_model,
+                pre_transform,
                 progress,
             )
             .await?;
@@ -1861,7 +1865,7 @@ pub async fn build_ivf_model_with_pca(
         "Loading training data for IVF. Sample size: {}",
         sample_size_hint
     );
-    let training_data = match pca_source.as_ref() {
+    let training_data = match pre_transform_source.as_ref() {
         Some(source) => source.sample(sample_size_hint).await?,
         None => maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?,
     };
@@ -1886,12 +1890,12 @@ pub async fn build_ivf_model_with_pca(
     };
 
     // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-    let training_data = if pca_source.is_none() {
+    let training_data = if pre_transform_source.is_none() {
         filter_finite_training_data(training_data)?
     } else {
         training_data
     };
-    if pca_source.is_some() && training_data.value_length() as usize != dim {
+    if pre_transform_source.is_some() && training_data.value_length() as usize != dim {
         return Err(Error::invalid_input(format!(
             "IVF training dimension={} does not match expected dimension={dim}",
             training_data.value_length()
@@ -3302,7 +3306,7 @@ async fn sample_ivf_training_chunk(
     sample_size_hint: usize,
     metric_type: MetricType,
     fragment_ids: Option<&[u32]>,
-    pca_model: Option<&PcaModel>,
+    pre_transform: Option<&dyn TrainingVectorTransform>,
 ) -> Result<(FixedSizeListArray, MetricType)> {
     let training_data =
         maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
@@ -3312,36 +3316,37 @@ async fn sample_ivf_training_chunk(
     } else {
         (training_data, metric_type)
     };
-    maybe_apply_pca_to_training_chunk(filter_finite_training_data(training_data)?, mt, pca_model)
+    apply_training_pre_transform(filter_finite_training_data(training_data)?, mt, pre_transform)
 }
 
-fn ensure_pca_training_l2(metric_type: MetricType) -> Result<()> {
+fn ensure_pre_transform_training_l2(metric_type: MetricType) -> Result<()> {
     if metric_type == MetricType::L2 {
         Ok(())
     } else {
         Err(Error::invalid_input(format!(
-            "PCA IVF training requires L2 distance, got {metric_type}"
+            "pre-transform IVF training requires L2 distance, got {metric_type}"
         )))
     }
 }
 
-fn maybe_apply_pca_to_training_chunk(
+/// The single point where IVF training applies a pre-transform to a sampled chunk.
+fn apply_training_pre_transform(
     training_data: FixedSizeListArray,
     metric_type: MetricType,
-    pca_model: Option<&PcaModel>,
+    pre_transform: Option<&dyn TrainingVectorTransform>,
 ) -> Result<(FixedSizeListArray, MetricType)> {
-    let Some(model) = pca_model else {
+    let Some(transform) = pre_transform else {
         return Ok((training_data, metric_type));
     };
-    ensure_pca_training_l2(metric_type)?;
-    if model.input_dimension() != training_data.value_length() as usize {
+    ensure_pre_transform_training_l2(metric_type)?;
+    if transform.input_dimension() != training_data.value_length() as usize {
         return Err(Error::invalid_input(format!(
-            "PCA input_dimension={} does not match streaming training vector dimension={}",
-            model.input_dimension(),
+            "pre-transform input_dimension={} does not match streaming training vector dimension={}",
+            transform.input_dimension(),
             training_data.value_length()
         )));
     }
-    Ok((model.transform(&training_data)?, MetricType::L2))
+    Ok((transform.transform_vectors(&training_data)?, MetricType::L2))
 }
 
 #[derive(Debug, Clone)]
@@ -3887,7 +3892,7 @@ async fn refine_streaming_f32_kmeans_with_sampler(
     initial_centroids: &FixedSizeListArray,
     passes: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
-    pca_model: Option<&PcaModel>,
+    pre_transform: Option<&dyn TrainingVectorTransform>,
 ) -> Result<FixedSizeListArray> {
     let dimension = initial_centroids.value_length() as usize;
     let mut centroids = initial_centroids.clone();
@@ -3901,7 +3906,7 @@ async fn refine_streaming_f32_kmeans_with_sampler(
             row_offset += ranges.iter().map(range_len).sum::<usize>();
             let (training_data, mt) = sampler.sample_ranges(&ranges, metric_type).await?;
             let (training_data, mt) =
-                maybe_apply_pca_to_training_chunk(training_data, mt, pca_model)?;
+                apply_training_pre_transform(training_data, mt, pre_transform)?;
             if mt != DistanceType::L2 {
                 return Err(Error::invalid_input(format!(
                     "streaming IVF refinement currently supports L2/Cosine training, got {}",
@@ -3941,7 +3946,7 @@ async fn refine_streaming_f32_kmeans_with_resampling(
     fragment_ids: Option<&[u32]>,
     passes: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
-    pca_model: Option<&PcaModel>,
+    pre_transform: Option<&dyn TrainingVectorTransform>,
 ) -> Result<FixedSizeListArray> {
     let dimension = initial_centroids.value_length() as usize;
     let mut centroids = initial_centroids.clone();
@@ -3959,7 +3964,7 @@ async fn refine_streaming_f32_kmeans_with_resampling(
                 step_sample_size,
                 metric_type,
                 fragment_ids,
-                pca_model,
+                pre_transform,
             )
             .await?;
             if mt != DistanceType::L2 {
@@ -4665,7 +4670,7 @@ async fn train_streaming_coreset_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
     fragment_ids: Option<&[u32]>,
-    pca_model: Option<&PcaModel>,
+    pre_transform: Option<&dyn TrainingVectorTransform>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap_or(32);
@@ -4744,7 +4749,7 @@ async fn train_streaming_coreset_ivf_model(
                 let ranges = sample_ranges.chunk(sample_offset, step_sample_size);
                 sample_offset += ranges.iter().map(range_len).sum::<usize>();
                 let (training_data, mt) = sampler.sample_ranges(&ranges, metric_type).await?;
-                maybe_apply_pca_to_training_chunk(training_data, mt, pca_model)?
+                apply_training_pre_transform(training_data, mt, pre_transform)?
             } else {
                 sample_ivf_training_chunk(
                     dataset,
@@ -4752,7 +4757,7 @@ async fn train_streaming_coreset_ivf_model(
                     step_sample_size,
                     metric_type,
                     fragment_ids,
-                    pca_model,
+                    pre_transform,
                 )
                 .await?
             };
@@ -4849,7 +4854,7 @@ async fn train_streaming_coreset_ivf_model(
                     &centroids,
                     params.streaming_refine_passes,
                     on_progress.clone(),
-                    pca_model,
+                    pre_transform,
                 )
                 .await?
             } else {
@@ -4864,7 +4869,7 @@ async fn train_streaming_coreset_ivf_model(
                     fragment_ids,
                     params.streaming_refine_passes,
                     on_progress.clone(),
-                    pca_model,
+                    pre_transform,
                 )
                 .await?
             };
@@ -4899,7 +4904,7 @@ async fn train_streaming_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
     fragment_ids: Option<&[u32]>,
-    pca_model: Option<&PcaModel>,
+    pre_transform: Option<&dyn TrainingVectorTransform>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap_or(32);
@@ -4911,7 +4916,7 @@ async fn train_streaming_ivf_model(
             metric_type,
             params,
             fragment_ids,
-            pca_model,
+            pre_transform,
             progress,
         )
         .await;
@@ -4960,7 +4965,7 @@ async fn train_streaming_ivf_model(
                 step_sample_size,
                 metric_type,
                 fragment_ids,
-                pca_model,
+                pre_transform,
             )
             .await?;
             if training_data.len() < num_partitions {
@@ -6487,7 +6492,7 @@ mod tests {
         params.streaming_refine_passes = 1;
         params.max_iters = 2;
 
-        let ivf_model = build_ivf_model_with_pca(
+        let ivf_model = build_ivf_model_with_context(
             &dataset,
             "vector",
             16,
@@ -6495,7 +6500,7 @@ mod tests {
             &params,
             IvfModelTrainingContext {
                 fragment_ids: None,
-                pca_model: Some(pca_model.as_ref()),
+                pre_transform: Some(pca_model.as_ref()),
                 progress: lance_index::progress::noop_progress(),
             },
         )
@@ -6941,7 +6946,7 @@ mod tests {
         let progress = Arc::new(CountingProgress::default());
         let ivf_model = tokio::time::timeout(
             Duration::from_secs(120),
-            build_ivf_model_with_pca(
+            build_ivf_model_with_context(
                 &dataset,
                 "vector",
                 OUTPUT_DIM,
@@ -6949,7 +6954,7 @@ mod tests {
                 &params,
                 IvfModelTrainingContext {
                     fragment_ids: None,
-                    pca_model: Some(pca_model.as_ref()),
+                    pre_transform: Some(pca_model.as_ref()),
                     progress: progress.clone(),
                 },
             ),

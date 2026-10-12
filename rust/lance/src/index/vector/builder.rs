@@ -99,7 +99,10 @@ use crate::index::vector::utils::infer_vector_dim;
 use super::v2::IVFIndex;
 use super::{
     ivf::load_precomputed_partitions_if_available,
-    training_source::{DatasetVectorSource, PreTransformVectorSource, VectorTrainingDataSource},
+    training_source::{
+        DatasetVectorSource, PreTransformVectorSource, TrainingVectorTransform,
+        VectorTrainingDataSource,
+    },
     utils::{self, get_vector_type},
 };
 
@@ -769,7 +772,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .ivf_params
                     .as_ref()
                     .ok_or(Error::invalid_input("IVF build params not set"))?;
-                super::build_ivf_model_with_pca(
+                super::build_ivf_model_with_context(
                     dataset,
                     &self.column,
                     dim,
@@ -777,7 +780,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf_params,
                     super::IvfModelTrainingContext {
                         fragment_ids: self.fragment_filter.as_deref(),
-                        pca_model: self.pca_model.as_deref(),
+                        pre_transform: self
+                            .pca_model
+                            .as_deref()
+                            .map(|model| model as &dyn TrainingVectorTransform),
                         progress: self.progress.clone(),
                     },
                 )
