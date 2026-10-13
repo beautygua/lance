@@ -704,7 +704,8 @@ impl CacheCodecImpl for IvfStateEntryBox {
         // then build an IvfStateEntryBox wrapping IvfIndexState<Q>.
         fn make_entry<Q: Quantization + 'static>(
             header: IvfStateHeader,
-            ivf_models: (IvfModel, IvfModel),
+            ivf: IvfModel,
+            aux_ivf: IvfModel,
             extra_bytes: bytes::Bytes,
             distance_type: DistanceType,
             sub_index_type: SubIndexType,
@@ -714,7 +715,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
             <Q::Storage as QuantizerStorage>::Metadata:
                 serde::de::DeserializeOwned + QuantizerMetadata,
         {
-            let (ivf, aux_ivf) = ivf_models;
             let mut metadata: <Q::Storage as QuantizerStorage>::Metadata =
                 serde_json::from_str(&header.quantizer_metadata_json)
                     .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;
@@ -740,7 +740,8 @@ impl CacheCodecImpl for IvfStateEntryBox {
         match quantization_type {
             QuantizationType::Flat => make_entry::<FlatQuantizer>(
                 header,
-                (ivf, aux_ivf),
+                ivf,
+                aux_ivf,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -748,7 +749,8 @@ impl CacheCodecImpl for IvfStateEntryBox {
             ),
             QuantizationType::FlatBin => make_entry::<FlatBinQuantizer>(
                 header,
-                (ivf, aux_ivf),
+                ivf,
+                aux_ivf,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -756,7 +758,8 @@ impl CacheCodecImpl for IvfStateEntryBox {
             ),
             QuantizationType::Product => make_entry::<ProductQuantizer>(
                 header,
-                (ivf, aux_ivf),
+                ivf,
+                aux_ivf,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -764,7 +767,8 @@ impl CacheCodecImpl for IvfStateEntryBox {
             ),
             QuantizationType::Scalar => make_entry::<ScalarQuantizer>(
                 header,
-                (ivf, aux_ivf),
+                ivf,
+                aux_ivf,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -772,7 +776,8 @@ impl CacheCodecImpl for IvfStateEntryBox {
             ),
             QuantizationType::Rabit => make_entry::<RabitQuantizer>(
                 header,
-                (ivf, aux_ivf),
+                ivf,
+                aux_ivf,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
