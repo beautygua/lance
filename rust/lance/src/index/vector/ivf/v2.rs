@@ -799,7 +799,6 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             quantizer_metadata_json,
             index_file_size: self.index_file_size,
             aux_file_size: self.aux_file_size,
-            pca_fingerprint: None,
         };
         let ivf_bytes = pb::Ivf::try_from(&self.ivf)?.encode_to_vec();
         let aux_ivf_bytes = pb::Ivf::try_from(&self.aux_ivf)?.encode_to_vec();
