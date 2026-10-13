@@ -898,4 +898,55 @@ mod tests {
         );
         assert_transformed_query(&transformed, &original);
     }
+
+    /// Names of the methods declared at the top level of the block that
+    /// starts with `header`.
+    fn method_names<'a>(source: &'a str, header: &str) -> Vec<&'a str> {
+        let mut lines = source.lines().skip_while(|line| line.trim_end() != header);
+        assert!(lines.next().is_some(), "{header} not found");
+        lines
+            .take_while(|line| line.trim_end() != "}")
+            .filter_map(|line| {
+                let line = line.strip_prefix("    ")?;
+                let rest = line
+                    .strip_prefix("async fn ")
+                    .or_else(|| line.strip_prefix("fn "))?;
+                rest.split(['(', '<']).next()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overrides_every_vector_index_method_or_lists_its_default() {
+        // Batch search keeps the trait default: it reports unsupported, so
+        // callers fall back to per-query search, which transforms each query.
+        const INHERITED_DEFAULTS: &[&str] =
+            &["supports_batch_partition_search", "search_partitions_batch"];
+
+        let declared = method_names(
+            include_str!("../vector.rs"),
+            "pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {",
+        );
+        let overridden = method_names(
+            include_str!("pretransform.rs"),
+            "impl VectorIndex for PreTransformIndex {",
+        );
+        assert!(declared.len() > INHERITED_DEFAULTS.len());
+        for method in &declared {
+            assert!(
+                overridden.contains(method) || INHERITED_DEFAULTS.contains(method),
+                "PreTransformIndex must override VectorIndex::{method} or list it in INHERITED_DEFAULTS"
+            );
+        }
+        for method in INHERITED_DEFAULTS {
+            assert!(
+                declared.contains(method),
+                "{method} is no longer a VectorIndex method"
+            );
+            assert!(
+                !overridden.contains(method),
+                "{method} is overridden; drop it from INHERITED_DEFAULTS"
+            );
+        }
+    }
 }
