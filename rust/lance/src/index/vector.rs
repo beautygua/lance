@@ -1723,7 +1723,7 @@ pub(crate) async fn build_empty_vector_index(
     column: &str,
     name: &str,
     _uuid: Uuid,
-    params: &VectorIndexParams,
+    _params: &VectorIndexParams,
 ) -> Result<Vec<IndexFile>> {
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed

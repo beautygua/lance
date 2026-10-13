@@ -3888,6 +3888,7 @@ fn drop_rows_that_saturated(cast: FixedSizeListArray) -> Result<FixedSizeListArr
     Ok(filtered.as_fixed_size_list().clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn refine_streaming_f32_kmeans_with_sampler(
     sampler: &FixedIvfTrainingSampler<'_>,
     metric_type: MetricType,

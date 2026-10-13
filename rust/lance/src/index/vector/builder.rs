@@ -3092,6 +3092,7 @@ where
         .map(|(i, _)| candidate_ids.value(i)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn choose_assignment_destination<T: ArrowPrimitiveType>(
     projected_f32: bool,
     distance_type: DistanceType,

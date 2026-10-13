@@ -21,14 +21,14 @@ use crate::{Error, Result};
 const PCA_TRAINING_BATCH_SIZE: usize = 4096;
 
 /// Shared PCA / IVF / RQ shape comparison used by both writers and readers.
-pub(crate) enum PcaComponentMismatch {
+pub enum PcaComponentMismatch {
     InputDimension { actual: usize, expected: usize },
     CentroidType { actual: DataType },
     OutputDimension { actual: usize, expected: usize },
     RqDimension { actual: usize, expected: usize },
 }
 
-pub(crate) fn pca_component_mismatch(
+pub fn pca_component_mismatch(
     model: &PcaModel,
     expected_input_dimension: usize,
     ivf_dimension: usize,
@@ -301,7 +301,7 @@ fn vectors_as_f64(vectors: &FixedSizeListArray, expected_dimension: usize) -> Re
 ///
 /// Kept off the shared vector-index builder so non-PCA builds keep the original
 /// `build_vector_index` signature and control flow.
-pub(crate) async fn build_pca_ivf_rq_index(
+pub async fn build_pca_ivf_rq_index(
     dataset: &Dataset,
     column: &str,
     uuid: uuid::Uuid,

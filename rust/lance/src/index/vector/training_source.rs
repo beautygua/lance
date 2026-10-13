@@ -11,7 +11,7 @@ use super::utils::{filter_finite_training_data, get_vector_dim, maybe_sample_tra
 use crate::Dataset;
 
 /// A trained pre-transform as seen by IVF training and partition assignment.
-pub(crate) trait TrainingVectorTransform: Send + Sync {
+pub trait TrainingVectorTransform: Send + Sync {
     fn input_dimension(&self) -> usize;
     fn output_dimension(&self) -> usize;
     /// Maps original-space vectors to Float32 vectors of `output_dimension`.
@@ -20,11 +20,11 @@ pub(crate) trait TrainingVectorTransform: Send + Sync {
 
 impl TrainingVectorTransform for PcaModel {
     fn input_dimension(&self) -> usize {
-        PcaModel::input_dimension(self)
+        Self::input_dimension(self)
     }
 
     fn output_dimension(&self) -> usize {
-        PcaModel::output_dimension(self)
+        Self::output_dimension(self)
     }
 
     fn transform_vectors(&self, vectors: &FixedSizeListArray) -> Result<FixedSizeListArray> {

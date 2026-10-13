@@ -85,7 +85,7 @@ impl IndexReader for PcaFileReaderAdapter<'_> {
 }
 
 /// Reads the optional pre-transform declared by an index file's schema metadata.
-pub(crate) async fn read_pre_transform(reader: &FileReader) -> Result<Option<Arc<PcaModel>>> {
+pub async fn read_pre_transform(reader: &FileReader) -> Result<Option<Arc<PcaModel>>> {
     let Some(buffer_index) = reader.schema().metadata.get(PCA_METADATA_KEY) else {
         return Ok(None);
     };
@@ -96,14 +96,14 @@ pub(crate) async fn read_pre_transform(reader: &FileReader) -> Result<Option<Arc
         .map(Some)
 }
 
-pub(crate) fn format_pca_fingerprint(fingerprint: &[u8; 32]) -> String {
+pub fn format_pca_fingerprint(fingerprint: &[u8; 32]) -> String {
     fingerprint
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-pub(crate) fn manifest_pca(index_meta: &IndexMetadata) -> Result<Option<(usize, [u8; 32])>> {
+pub fn manifest_pca(index_meta: &IndexMetadata) -> Result<Option<(usize, [u8; 32])>> {
     let (pca, details_index_type) = match index_meta.index_details.as_deref() {
         Some(details) => (
             pca_params_from_details(details)?
@@ -139,7 +139,7 @@ pub(crate) fn manifest_pca(index_meta: &IndexMetadata) -> Result<Option<(usize, 
     }
 }
 
-pub(crate) fn validate_pca_manifest_and_model(
+pub fn validate_pca_manifest_and_model(
     index_meta: &IndexMetadata,
     physical_index_type: Option<&str>,
     model: Option<&Arc<PcaModel>>,
@@ -203,7 +203,7 @@ pub(crate) fn validate_pca_manifest_and_model(
     }
 }
 
-pub(crate) fn validate_pca_index_dimensions(
+pub fn validate_pca_index_dimensions(
     index_meta: &IndexMetadata,
     model: Option<&Arc<PcaModel>>,
     index: &Arc<dyn VectorIndex>,
@@ -253,7 +253,7 @@ pub(crate) fn validate_pca_index_dimensions(
     )
 }
 
-pub(crate) fn validate_pca_shape(
+pub fn validate_pca_shape(
     index_version: i32,
     model: &PcaModel,
     expected_input_dimension: usize,
@@ -302,7 +302,7 @@ pub(crate) fn validate_pca_shape(
     }
 }
 
-pub(crate) fn validate_logical_pca_fingerprints<'a>(
+pub fn validate_logical_pca_fingerprints<'a>(
     index_name: &str,
     segments: impl IntoIterator<Item = &'a IndexMetadata>,
 ) -> Result<()> {
@@ -343,7 +343,7 @@ fn attach_loaded_pre_transform(
     Ok(index)
 }
 
-pub(crate) struct PreTransformIndexStateCacheKey<'a> {
+pub struct PreTransformIndexStateCacheKey<'a> {
     uuid: &'a Uuid,
     fri_uuid: Option<&'a Uuid>,
 }
@@ -389,7 +389,7 @@ impl CacheKey for PreTransformIndexStateCacheKey<'_> {
 /// This is the only type the vector index open path consults about
 /// pre-transforms: cached state, file container checks, reading the stored
 /// model and wrapping the opened index all go through it.
-pub(crate) struct DeclaredPreTransform<'a> {
+pub struct DeclaredPreTransform<'a> {
     index_meta: &'a IndexMetadata,
     frag_reuse_uuid: Option<&'a Uuid>,
     declared: bool,
@@ -511,7 +511,7 @@ impl<'a> DeclaredPreTransform<'a> {
 /// Cached IVF state plus the pre-transform that must be reattached on open.
 ///
 /// The IVF cache entry itself stays free of pre-transform bytes.
-pub(crate) struct PreTransformIndexState {
+pub struct PreTransformIndexState {
     pub(crate) inner: IvfStateEntryBox,
     pub(crate) model: Arc<PcaModel>,
 }
