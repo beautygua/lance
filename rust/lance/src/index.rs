@@ -41,7 +41,6 @@ use lance_index::scalar::{CreatedIndex, ScalarIndex, index_files_to_table, table
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
-use lance_index::vector::pca::PcaModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
@@ -78,7 +77,7 @@ pub(crate) use vector::details::{
     vector_index_details, vector_index_details_default, vector_index_details_with_pca,
 };
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
-use vector::utils::{get_vector_type, infer_vector_dim};
+use vector::utils::get_vector_type;
 
 mod api;
 pub(crate) mod append;
@@ -1023,82 +1022,6 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
     fn codec() -> Option<lance_core::cache::CacheCodec> {
         Some(lance_core::cache::CacheCodec::from_impl::<IvfStateEntryBox>())
     }
-}
-
-pub(crate) struct PreTransformIndexStateCacheKey<'a> {
-    uuid: &'a Uuid,
-    fri_uuid: Option<&'a Uuid>,
-}
-
-impl<'a> PreTransformIndexStateCacheKey<'a> {
-    fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
-        Self { uuid, fri_uuid }
-    }
-}
-
-impl CacheKey for PreTransformIndexStateCacheKey<'_> {
-    type ValueType = vector::pca_load::PreTransformIndexState;
-
-    fn type_name() -> &'static str {
-        "PreTransformIndexState"
-    }
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(fri_uuid) = self.fri_uuid {
-            format!("pca-{}-{}", self.uuid, fri_uuid).into()
-        } else {
-            format!("pca-{}", self.uuid).into()
-        }
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.pca-state-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        write_index_identity(builder, self.uuid, self.fri_uuid);
-    }
-
-    fn codec() -> Option<lance_core::cache::CacheCodec> {
-        Some(lance_core::cache::CacheCodec::from_impl::<vector::pca_load::PreTransformIndexState>())
-    }
-}
-
-fn manifest_pca(index_meta: &IndexMetadata) -> Result<Option<(usize, [u8; 32])>> {
-    vector::manifest_pca(index_meta)
-}
-
-fn validate_pca_manifest_and_model(
-    index_meta: &IndexMetadata,
-    physical_index_type: Option<&str>,
-    model: Option<&Arc<PcaModel>>,
-) -> Result<()> {
-    vector::validate_pca_manifest_and_model(index_meta, physical_index_type, model)
-}
-
-fn validate_pca_shape(
-    index_version: i32,
-    model: &PcaModel,
-    expected_input_dimension: usize,
-    ivf_dimension: usize,
-    centroid_type: &DataType,
-    rq_rotated_dimension: usize,
-) -> Result<()> {
-    vector::validate_pca_shape(
-        index_version,
-        model,
-        expected_input_dimension,
-        ivf_dimension,
-        centroid_type,
-        rq_rotated_dimension,
-    )
-}
-
-fn validate_logical_pca_fingerprints<'a>(
-    index_name: &str,
-    segments: impl IntoIterator<Item = &'a IndexMetadata>,
-) -> Result<()> {
-    vector::validate_logical_pca_fingerprints(index_name, segments)
 }
 
 /// Wrapper that stores a live VectorIndex in the cache.
@@ -3047,11 +2970,6 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
 
         // Check sized cache for IvfIndexState (v2+ indices).
-        let pca_state_key = PreTransformIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if self.index_cache.get_with_key(&pca_state_key).await.is_some() {
-            let index = self.open_vector_index(column, uuid, metrics).await?;
-            return Ok(index.as_index());
-        }
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if self.index_cache.get_with_key(&state_key).await.is_some() {
             // Reconstruct via open_vector_index which will hit the same sized key.
@@ -3133,19 +3051,17 @@ impl DatasetIndexInternalExt for Dataset {
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        let manifest_pca_metadata = manifest_pca(&index_meta)?;
+        let pre_transform = vector::pca_load::DeclaredPreTransform::from_manifest(
+            &index_meta,
+            frag_reuse_uuid.as_ref(),
+        )?;
         let object_store = self.object_store_for_index(&index_meta).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        let pca_state_key = PreTransformIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if manifest_pca_metadata.is_some()
-            && let Some(entry) = self.index_cache.get_with_key(&pca_state_key).await
-        {
+        if let Some(entry) = pre_transform.cached_state(&self.index_cache).await? {
             log::debug!("Found PreTransformIndexState in cache uuid: {}", uuid);
-            validate_pca_manifest_and_model(&index_meta, None, Some(&entry.model))?;
             let (_, field) = resolve_index_column(self.schema(), &index_meta, column)?;
-            let input_dimension = infer_vector_dim(&field.data_type())?;
             let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             let index = entry
@@ -3158,18 +3074,12 @@ impl DatasetIndexInternalExt for Dataset {
                     frag_reuse_index,
                 )
                 .await?;
-            return vector::attach_loaded_pre_transform(
-                index,
-                Some(&entry.model),
-                &index_meta,
-                input_dimension,
-            );
+            return pre_transform.attach_cached(index, &entry, &field.data_type());
         }
-        if manifest_pca_metadata.is_none()
+        if !pre_transform.is_declared()
             && let Some(entry) = self.index_cache.get_with_key(&state_key).await
         {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            validate_pca_manifest_and_model(&index_meta, None, None)?;
             let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
@@ -3207,17 +3117,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
-        if manifest_pca_metadata.is_some()
-            && !matches!((major_version, minor_version), (0, 3) | (2, _))
-        {
-            return Err(Error::corrupt_file_named(
-                INDEX_FILE_NAME,
-                format!(
-                    "manifest index_version={} declares PCA for index {}, but file container version=({major_version},{minor_version}) cannot store lance:pca global-buffer metadata",
-                    index_meta.index_version, index_meta.uuid
-                ),
-            ));
-        }
+        pre_transform.check_container_version(major_version, minor_version)?;
 
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
@@ -3308,17 +3208,9 @@ impl DatasetIndexInternalExt for Dataset {
                 let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
-                let pca_model = vector::pca_load::read_pre_transform(&reader).await?;
-                validate_pca_manifest_and_model(
-                    &index_meta,
-                    Some(&index_metadata.index_type),
-                    pca_model.as_ref(),
-                )?;
-                let input_dimension = if pca_model.is_some() {
-                    infer_vector_dim(&field.data_type())?
-                } else {
-                    0
-                };
+                let pre_transform_model = pre_transform
+                    .read(&reader, &index_metadata.index_type)
+                    .await?;
 
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
@@ -3461,25 +3353,15 @@ impl DatasetIndexInternalExt for Dataset {
                     ))),
                 }?;
                 let (index, ivf_entry) = loaded;
-                if let Some(model) = pca_model {
-                    let index = vector::attach_loaded_pre_transform(
+                pre_transform
+                    .attach_opened(
+                        &self.index_cache,
                         index,
-                        Some(&model),
-                        &index_meta,
-                        input_dimension,
-                    )?;
-                    if let Some(inner) = ivf_entry {
-                        self.index_cache
-                            .insert_with_key(
-                                &pca_state_key,
-                                Arc::new(vector::pca_load::PreTransformIndexState { inner, model }),
-                            )
-                            .await;
-                    }
-                    Ok((index, None))
-                } else {
-                    Ok((index, ivf_entry))
-                }
+                        ivf_entry,
+                        pre_transform_model,
+                        &field.data_type(),
+                    )
+                    .await
             }
 
             _ => Err(Error::index(
@@ -3501,7 +3383,7 @@ impl DatasetIndexInternalExt for Dataset {
             self.index_cache
                 .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;
-        } else if manifest_pca_metadata.is_none() {
+        } else if !pre_transform.is_declared() {
             self.index_cache
                 .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
                 .await;
@@ -3537,7 +3419,10 @@ impl DatasetIndexInternalExt for Dataset {
                 .await?;
             segments.push((metadata, index));
         }
-        validate_logical_pca_fingerprints(name, segments.iter().map(|(metadata, _)| metadata))?;
+        vector::pca_load::validate_logical_pca_fingerprints(
+            name,
+            segments.iter().map(|(metadata, _)| metadata),
+        )?;
 
         LogicalVectorIndex::try_new(name.to_string(), column.to_string(), segments)
     }
@@ -3989,151 +3874,6 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
     };
-
-    fn test_pca_model() -> Arc<PcaModel> {
-        let vectors = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![
-                1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, -1.0, -1.0, -1.0,
-            ]),
-            3,
-        )
-        .unwrap();
-        Arc::new(PcaModel::train(&vectors, &lance_index::vector::pca::PcaParams::new(2)).unwrap())
-    }
-
-    fn test_pca_details(fingerprint: [u8; 32]) -> Arc<prost_types::Any> {
-        use lance_index::pb::vector_index_details::{Compression, RabitQuantization};
-        use lance_index::pb::{PcaParameters, VectorIndexDetails, VectorMetricType};
-
-        Arc::new(
-            prost_types::Any::from_msg(&VectorIndexDetails {
-                metric_type: VectorMetricType::L2.into(),
-                target_partition_size: 0,
-                hnsw_index_config: None,
-                compression: Some(Compression::Rq(RabitQuantization {
-                    num_bits: 1,
-                    rotation_type: 0,
-                })),
-                runtime_hints: Default::default(),
-                pca: Some(PcaParameters {
-                    dimension: 2,
-                    random_rotation: false,
-                    whitening: false,
-                    epsilon: 1.0e-5,
-                    sample_size: 4,
-                    max_training_memory_bytes: 1024,
-                    sampling_seed: 42,
-                    rotation_seed: 5,
-                    model_fingerprint: fingerprint.to_vec(),
-                }),
-            })
-            .unwrap(),
-        )
-    }
-
-    fn test_pca_index_metadata(
-        index_version: i32,
-        details: Option<Arc<prost_types::Any>>,
-    ) -> IndexMetadata {
-        IndexMetadata {
-            uuid: Uuid::new_v4(),
-            fields: vec![0],
-            covering_fields: Vec::new(),
-            name: "pca_idx".to_string(),
-            dataset_version: 1,
-            fragment_bitmap: None,
-            index_details: details,
-            index_version,
-            created_at: None,
-            base_id: None,
-            files: None,
-        }
-    }
-
-    #[test]
-    fn test_pca_manifest_version_and_physical_presence_validation() {
-        let model = test_pca_model();
-        let v3_without_details = test_pca_index_metadata(3, None);
-        let error =
-            validate_pca_manifest_and_model(&v3_without_details, Some("IVF_RQ"), Some(&model))
-                .unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("index_version=3"));
-        assert!(error.to_string().contains("index_details"));
-
-        let v2_with_details =
-            test_pca_index_metadata(2, Some(test_pca_details(model.fingerprint())));
-        let error = validate_pca_manifest_and_model(&v2_with_details, Some("IVF_RQ"), Some(&model))
-            .unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("index_version=2"));
-        assert!(error.to_string().contains("PCA details"));
-
-        let v2_with_physical_model = test_pca_index_metadata(2, None);
-        let error =
-            validate_pca_manifest_and_model(&v2_with_physical_model, Some("IVF_RQ"), Some(&model))
-                .unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("index_version=2"));
-        assert!(error.to_string().contains("physical lance:pca"));
-
-        let v3 = test_pca_index_metadata(3, Some(test_pca_details(model.fingerprint())));
-        validate_pca_manifest_and_model(&v3, Some("IVF_RQ"), Some(&model)).unwrap();
-        let error = validate_pca_manifest_and_model(&v3, Some("IVF_RQ"), None).unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("lance:pca"));
-
-        let error = validate_pca_manifest_and_model(&v3, Some("IVF_PQ"), Some(&model)).unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("physical index_type=IVF_PQ"));
-    }
-
-    #[test]
-    fn test_pca_manifest_rejects_fingerprint_and_segment_mismatch() {
-        let model = test_pca_model();
-        let mismatched = test_pca_index_metadata(3, Some(test_pca_details([0x5a; 32])));
-        let error =
-            validate_pca_manifest_and_model(&mismatched, Some("IVF_RQ"), Some(&model)).unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("fingerprint mismatch"));
-        assert!(error.to_string().contains("expected="));
-        assert!(error.to_string().contains("actual="));
-
-        let first = test_pca_index_metadata(3, Some(test_pca_details(model.fingerprint())));
-        let second = test_pca_index_metadata(3, Some(test_pca_details([0xa5; 32])));
-        let error = validate_logical_pca_fingerprints("pca_idx", [&first, &second]).unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("inconsistent PCA fingerprints"));
-        assert!(error.to_string().contains(&second.uuid.to_string()));
-    }
-
-    #[rstest]
-    #[case::input_dimension(4, 2, DataType::Float32, 2, "input_dimension")]
-    #[case::output_dimension(3, 1, DataType::Float32, 2, "output_dimension")]
-    #[case::centroid_dtype(3, 2, DataType::Float64, 2, "centroid dtype")]
-    #[case::rq_dimension(3, 2, DataType::Float32, 1, "rotated_dim")]
-    fn test_pca_shape_validation(
-        #[case] input_dimension: usize,
-        #[case] ivf_dimension: usize,
-        #[case] centroid_type: DataType,
-        #[case] rq_rotated_dimension: usize,
-        #[case] expected_message: &str,
-    ) {
-        let model = test_pca_model();
-        let error = validate_pca_shape(
-            3,
-            model.as_ref(),
-            input_dimension,
-            ivf_dimension,
-            &centroid_type,
-            rq_rotated_dimension,
-        )
-        .unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains(expected_message), "{error}");
-        assert!(error.to_string().contains("actual="), "{error}");
-        assert!(error.to_string().contains("expected="), "{error}");
-    }
 
     async fn write_vector_segment_metadata(
         dataset: &Dataset,

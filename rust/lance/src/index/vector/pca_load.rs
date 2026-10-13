@@ -8,7 +8,10 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+use lance_core::cache::{
+    CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema, KeyBuilder,
+    LanceCache,
+};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::reader::FileReader;
@@ -22,11 +25,14 @@ use lance_index::vector::pretransform::PreTransformIndex;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::{INDEX_FILE_NAME, IndexType};
 use lance_table::format::IndexMetadata;
+use uuid::Uuid;
 
 use super::ivf::v2::IvfStateEntryBox;
 
 use super::details::{derive_vector_index_type, pca_params_from_details};
+use super::utils::infer_vector_dim;
 use super::{PcaComponentMismatch, pca_component_mismatch};
+use crate::session::index_caches::write_index_identity;
 use crate::{Error, Result};
 
 struct PcaFileReaderAdapter<'a> {
@@ -321,7 +327,7 @@ pub(crate) fn validate_logical_pca_fingerprints<'a>(
 }
 
 /// Wraps a loaded IVF index with its pre-transform and checks the pair.
-pub(crate) fn attach_loaded_pre_transform(
+fn attach_loaded_pre_transform(
     index: Arc<dyn VectorIndex>,
     model: Option<&Arc<PcaModel>>,
     index_meta: &IndexMetadata,
@@ -335,6 +341,165 @@ pub(crate) fn attach_loaded_pre_transform(
     };
     validate_pca_index_dimensions(index_meta, model, &index, input_dimension)?;
     Ok(index)
+}
+
+pub(crate) struct PreTransformIndexStateCacheKey<'a> {
+    uuid: &'a Uuid,
+    fri_uuid: Option<&'a Uuid>,
+}
+
+impl<'a> PreTransformIndexStateCacheKey<'a> {
+    pub(crate) fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
+        Self { uuid, fri_uuid }
+    }
+}
+
+impl CacheKey for PreTransformIndexStateCacheKey<'_> {
+    type ValueType = PreTransformIndexState;
+
+    fn type_name() -> &'static str {
+        "PreTransformIndexState"
+    }
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("pca-{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            format!("pca-{}", self.uuid).into()
+        }
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.pca-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
+
+    fn codec() -> Option<lance_core::cache::CacheCodec> {
+        Some(lance_core::cache::CacheCodec::from_impl::<PreTransformIndexState>())
+    }
+}
+
+/// The pre-transform an index segment declares in its manifest.
+///
+/// This is the only type the vector index open path consults about
+/// pre-transforms: cached state, file container checks, reading the stored
+/// model and wrapping the opened index all go through it.
+pub(crate) struct DeclaredPreTransform<'a> {
+    index_meta: &'a IndexMetadata,
+    frag_reuse_uuid: Option<&'a Uuid>,
+    declared: bool,
+}
+
+impl<'a> DeclaredPreTransform<'a> {
+    pub(crate) fn from_manifest(
+        index_meta: &'a IndexMetadata,
+        frag_reuse_uuid: Option<&'a Uuid>,
+    ) -> Result<Self> {
+        Ok(Self {
+            index_meta,
+            frag_reuse_uuid,
+            declared: manifest_pca(index_meta)?.is_some(),
+        })
+    }
+
+    pub(crate) fn is_declared(&self) -> bool {
+        self.declared
+    }
+
+    fn state_key(&self) -> PreTransformIndexStateCacheKey<'_> {
+        PreTransformIndexStateCacheKey::new(&self.index_meta.uuid, self.frag_reuse_uuid)
+    }
+
+    /// The cached state of a declared pre-transformed index, checked against
+    /// the manifest.
+    pub(crate) async fn cached_state(
+        &self,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<PreTransformIndexState>>> {
+        if !self.declared {
+            return Ok(None);
+        }
+        let Some(entry) = cache.get_with_key(&self.state_key()).await else {
+            return Ok(None);
+        };
+        validate_pca_manifest_and_model(self.index_meta, None, Some(&entry.model))?;
+        Ok(Some(entry))
+    }
+
+    /// Rejects index file containers that cannot hold a pre-transform.
+    pub(crate) fn check_container_version(&self, major: u16, minor: u16) -> Result<()> {
+        if self.declared && !matches!((major, minor), (0, 3) | (2, _)) {
+            return Err(Error::corrupt_file_named(
+                INDEX_FILE_NAME,
+                format!(
+                    "manifest index_version={} declares PCA for index {}, but file container version=({major},{minor}) cannot store lance:pca global-buffer metadata",
+                    self.index_meta.index_version, self.index_meta.uuid
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads the pre-transform stored in an index file and checks it against
+    /// the manifest.
+    pub(crate) async fn read(
+        &self,
+        reader: &FileReader,
+        physical_index_type: &str,
+    ) -> Result<Option<Arc<PcaModel>>> {
+        let model = read_pre_transform(reader).await?;
+        validate_pca_manifest_and_model(self.index_meta, Some(physical_index_type), model.as_ref())?;
+        Ok(model)
+    }
+
+    /// Wraps an index rebuilt from [`Self::cached_state`].
+    pub(crate) fn attach_cached(
+        &self,
+        index: Arc<dyn VectorIndex>,
+        entry: &PreTransformIndexState,
+        vector_type: &DataType,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        attach_loaded_pre_transform(
+            index,
+            Some(&entry.model),
+            self.index_meta,
+            infer_vector_dim(vector_type)?,
+        )
+    }
+
+    /// Wraps a freshly opened IVF index with the model from [`Self::read`]
+    /// and caches the pair. Without a model the index and its IVF state pass
+    /// through unchanged.
+    pub(crate) async fn attach_opened(
+        &self,
+        cache: &LanceCache,
+        index: Arc<dyn VectorIndex>,
+        ivf_entry: Option<IvfStateEntryBox>,
+        model: Option<Arc<PcaModel>>,
+        vector_type: &DataType,
+    ) -> Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> {
+        let Some(model) = model else {
+            return Ok((index, ivf_entry));
+        };
+        let index = attach_loaded_pre_transform(
+            index,
+            Some(&model),
+            self.index_meta,
+            infer_vector_dim(vector_type)?,
+        )?;
+        if let Some(inner) = ivf_entry {
+            cache
+                .insert_with_key(
+                    &self.state_key(),
+                    Arc::new(PreTransformIndexState { inner, model }),
+                )
+                .await;
+        }
+        Ok((index, None))
+    }
 }
 
 /// Cached IVF state plus the pre-transform that must be reattached on open.
@@ -431,5 +596,166 @@ impl CacheCodecImpl for PreTransformIndexState {
             inner,
             model: Arc::new(model),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use arrow_schema::DataType;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::pca::PcaModel;
+    use lance_table::format::IndexMetadata;
+    use rstest::rstest;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::Error;
+
+    fn test_pca_model() -> Arc<PcaModel> {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, -1.0, -1.0, -1.0,
+            ]),
+            3,
+        )
+        .unwrap();
+        Arc::new(PcaModel::train(&vectors, &lance_index::vector::pca::PcaParams::new(2)).unwrap())
+    }
+
+    fn test_pca_details(fingerprint: [u8; 32]) -> Arc<prost_types::Any> {
+        use lance_index::pb::vector_index_details::{Compression, RabitQuantization};
+        use lance_index::pb::{PcaParameters, VectorIndexDetails, VectorMetricType};
+
+        Arc::new(
+            prost_types::Any::from_msg(&VectorIndexDetails {
+                metric_type: VectorMetricType::L2.into(),
+                target_partition_size: 0,
+                hnsw_index_config: None,
+                compression: Some(Compression::Rq(RabitQuantization {
+                    num_bits: 1,
+                    rotation_type: 0,
+                })),
+                runtime_hints: Default::default(),
+                pca: Some(PcaParameters {
+                    dimension: 2,
+                    random_rotation: false,
+                    whitening: false,
+                    epsilon: 1.0e-5,
+                    sample_size: 4,
+                    max_training_memory_bytes: 1024,
+                    sampling_seed: 42,
+                    rotation_seed: 5,
+                    model_fingerprint: fingerprint.to_vec(),
+                }),
+            })
+            .unwrap(),
+        )
+    }
+
+    fn test_pca_index_metadata(
+        index_version: i32,
+        details: Option<Arc<prost_types::Any>>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![0],
+            covering_fields: Vec::new(),
+            name: "pca_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: details,
+            index_version,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn test_pca_manifest_version_and_physical_presence_validation() {
+        let model = test_pca_model();
+        let v3_without_details = test_pca_index_metadata(3, None);
+        let error =
+            validate_pca_manifest_and_model(&v3_without_details, Some("IVF_RQ"), Some(&model))
+                .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("index_version=3"));
+        assert!(error.to_string().contains("index_details"));
+
+        let v2_with_details =
+            test_pca_index_metadata(2, Some(test_pca_details(model.fingerprint())));
+        let error = validate_pca_manifest_and_model(&v2_with_details, Some("IVF_RQ"), Some(&model))
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("index_version=2"));
+        assert!(error.to_string().contains("PCA details"));
+
+        let v2_with_physical_model = test_pca_index_metadata(2, None);
+        let error =
+            validate_pca_manifest_and_model(&v2_with_physical_model, Some("IVF_RQ"), Some(&model))
+                .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("index_version=2"));
+        assert!(error.to_string().contains("physical lance:pca"));
+
+        let v3 = test_pca_index_metadata(3, Some(test_pca_details(model.fingerprint())));
+        validate_pca_manifest_and_model(&v3, Some("IVF_RQ"), Some(&model)).unwrap();
+        let error = validate_pca_manifest_and_model(&v3, Some("IVF_RQ"), None).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("lance:pca"));
+
+        let error = validate_pca_manifest_and_model(&v3, Some("IVF_PQ"), Some(&model)).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("physical index_type=IVF_PQ"));
+    }
+
+    #[test]
+    fn test_pca_manifest_rejects_fingerprint_and_segment_mismatch() {
+        let model = test_pca_model();
+        let mismatched = test_pca_index_metadata(3, Some(test_pca_details([0x5a; 32])));
+        let error =
+            validate_pca_manifest_and_model(&mismatched, Some("IVF_RQ"), Some(&model)).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("fingerprint mismatch"));
+        assert!(error.to_string().contains("expected="));
+        assert!(error.to_string().contains("actual="));
+
+        let first = test_pca_index_metadata(3, Some(test_pca_details(model.fingerprint())));
+        let second = test_pca_index_metadata(3, Some(test_pca_details([0xa5; 32])));
+        let error = validate_logical_pca_fingerprints("pca_idx", [&first, &second]).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("inconsistent PCA fingerprints"));
+        assert!(error.to_string().contains(&second.uuid.to_string()));
+    }
+
+    #[rstest]
+    #[case::input_dimension(4, 2, DataType::Float32, 2, "input_dimension")]
+    #[case::output_dimension(3, 1, DataType::Float32, 2, "output_dimension")]
+    #[case::centroid_dtype(3, 2, DataType::Float64, 2, "centroid dtype")]
+    #[case::rq_dimension(3, 2, DataType::Float32, 1, "rotated_dim")]
+    fn test_pca_shape_validation(
+        #[case] input_dimension: usize,
+        #[case] ivf_dimension: usize,
+        #[case] centroid_type: DataType,
+        #[case] rq_rotated_dimension: usize,
+        #[case] expected_message: &str,
+    ) {
+        let model = test_pca_model();
+        let error = validate_pca_shape(
+            3,
+            model.as_ref(),
+            input_dimension,
+            ivf_dimension,
+            &centroid_type,
+            rq_rotated_dimension,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains(expected_message), "{error}");
+        assert!(error.to_string().contains("actual="), "{error}");
+        assert!(error.to_string().contains("expected="), "{error}");
     }
 }
