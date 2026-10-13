@@ -632,9 +632,7 @@ mod tests {
     }
 
     fn test_pca_details(fingerprint: [u8; 32]) -> Arc<prost_types::Any> {
-        use lance_index::pb::vector_index_details::{
-            Compression, PreTransform, RabitQuantization,
-        };
+        use lance_index::pb::vector_index_details::{Compression, PreTransform, RabitQuantization};
         use lance_index::pb::{PcaParameters, VectorIndexDetails, VectorMetricType};
 
         Arc::new(

@@ -1483,7 +1483,7 @@ pub fn accumulate_centered_scatter(
             "PCA scatter accumulation requires a non-empty mean".to_string(),
         ));
     }
-    if values.is_empty() || values.len() % dimension != 0 {
+    if values.is_empty() || !values.len().is_multiple_of(dimension) {
         return Err(Error::invalid_input(format!(
             "PCA scatter batch values length={} must be a non-zero multiple of dimension={dimension}",
             values.len()
