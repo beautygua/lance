@@ -464,6 +464,29 @@ impl<'a> CreateIndexBuilder<'a> {
                 )
                 .await?
             }
+            (_, LANCE_VECTOR_INDEX) if pca_vector_params(self.params).is_some() => {
+                let vec_params = pca_vector_params(self.params).ok_or_else(|| {
+                    Error::internal("PCA vector params checked by the match guard")
+                })?;
+                let summary = Box::pin(build_pca_ivf_rq_index(
+                    self.dataset,
+                    column,
+                    index_id,
+                    vec_params,
+                    fri,
+                    train && self.fragments.is_none(),
+                    self.progress.clone(),
+                ))
+                .await?;
+                CreatedIndex {
+                    index_details: vector_index_details_with_pca(
+                        vec_params,
+                        summary.pca_fingerprint,
+                    )?,
+                    index_version: vec_params.compatibility_version(),
+                    files: table_files_to_index(summary.files),
+                }
+            }
             (
                 IndexType::Vector
                 | IndexType::IvfPq
@@ -483,23 +506,11 @@ impl<'a> CreateIndexBuilder<'a> {
                     .ok_or_else(|| {
                         Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
-                let index_version = vec_params.compatibility_version();
+                let index_version = vec_params.index_type().version() as u32;
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let (files, pca_fingerprint) = if vec_params.pca_params().is_some() {
-                    let summary = Box::pin(build_pca_ivf_rq_index(
-                        self.dataset,
-                        column,
-                        index_id,
-                        vec_params,
-                        fri,
-                        train && self.fragments.is_none(),
-                        self.progress.clone(),
-                    ))
-                    .await?;
-                    (summary.files, summary.pca_fingerprint)
-                } else if train {
+                let files = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
                         if vector_params_have_precomputed_ivf(vec_params) {
@@ -517,9 +528,9 @@ impl<'a> CreateIndexBuilder<'a> {
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
-                            (files, None)
+                            files
                         } else {
-                            let files = Box::pin(build_filtered_vector_index(
+                            Box::pin(build_filtered_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
@@ -529,12 +540,11 @@ impl<'a> CreateIndexBuilder<'a> {
                                 fragments,
                                 self.progress.clone(),
                             ))
-                            .await?;
-                            (files, None)
+                            .await?
                         }
                     } else {
                         // Standard full dataset indexing
-                        let files = Box::pin(build_vector_index(
+                        Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -543,23 +553,21 @@ impl<'a> CreateIndexBuilder<'a> {
                             fri,
                             self.progress.clone(),
                         ))
-                        .await?;
-                        (files, None)
+                        .await?
                     }
                 } else {
                     // Create empty vector index
-                    let files = build_empty_vector_index(
+                    build_empty_vector_index(
                         self.dataset,
                         column,
                         &index_name,
                         index_id,
                         vec_params,
                     )
-                    .await?;
-                    (files, None)
+                    .await?
                 };
                 CreatedIndex {
-                    index_details: vector_index_details_with_pca(vec_params, pca_fingerprint)?,
+                    index_details: vector_index_details(vec_params),
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -975,6 +983,14 @@ fn vector_params_have_precomputed_ivf(params: &VectorIndexParams) -> bool {
         params.stages.first(),
         Some(StageParams::Ivf(ivf_params)) if ivf_params.centroids.is_some()
     )
+}
+
+/// Vector index params that request a PCA pre-transform.
+fn pca_vector_params(params: &dyn IndexParams) -> Option<&VectorIndexParams> {
+    params
+        .as_any()
+        .downcast_ref::<VectorIndexParams>()
+        .filter(|params| params.pca_params().is_some())
 }
 
 fn effective_vector_fragments(dataset: &Dataset, fragments: Option<&[u32]>) -> Option<Vec<u32>> {
