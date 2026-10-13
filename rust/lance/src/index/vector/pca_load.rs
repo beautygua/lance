@@ -632,7 +632,9 @@ mod tests {
     }
 
     fn test_pca_details(fingerprint: [u8; 32]) -> Arc<prost_types::Any> {
-        use lance_index::pb::vector_index_details::{Compression, RabitQuantization};
+        use lance_index::pb::vector_index_details::{
+            Compression, PreTransform, RabitQuantization,
+        };
         use lance_index::pb::{PcaParameters, VectorIndexDetails, VectorMetricType};
 
         Arc::new(
@@ -645,7 +647,7 @@ mod tests {
                     rotation_type: 0,
                 })),
                 runtime_hints: Default::default(),
-                pca: Some(PcaParameters {
+                pre_transform: Some(PreTransform::Pca(PcaParameters {
                     dimension: 2,
                     random_rotation: false,
                     whitening: false,
@@ -655,7 +657,7 @@ mod tests {
                     sampling_seed: 42,
                     rotation_seed: 5,
                     model_fingerprint: fingerprint.to_vec(),
-                }),
+                })),
             })
             .unwrap(),
         )

@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use lance_file::reader::FileReaderOptions;
 use lance_index::pb::index::Implementation;
-use lance_index::pb::vector_index_details::{Compression, FlatCompression, rabit_quantization};
+use lance_index::pb::vector_index_details::{
+    Compression, FlatCompression, PreTransform, rabit_quantization,
+};
 use lance_index::pb::{PcaParameters, VectorIndexDetails, VectorMetricType};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -228,7 +230,7 @@ fn vector_index_details_proto(params: &VectorIndexParams) -> VectorIndexDetails 
         hnsw_index_config,
         compression,
         runtime_hints,
-        pca: None,
+        pre_transform: None,
     }
 }
 
@@ -243,7 +245,8 @@ pub fn vector_index_details_with_pca(
     model_fingerprint: Option<[u8; 32]>,
 ) -> Result<prost_types::Any> {
     let mut details = vector_index_details_proto(params);
-    details.pca = pca_parameters(params.pca_params(), model_fingerprint)?;
+    details.pre_transform =
+        pca_parameters(params.pca_params(), model_fingerprint)?.map(PreTransform::Pca);
     prost_types::Any::from_msg(&details)
         .map_err(|e| Error::index(format!("Failed to serialize VectorIndexDetails: {e}")))
 }
@@ -266,7 +269,7 @@ pub fn pca_params_from_details(
             format!("failed to decode VectorIndexDetails: {error}"),
         )
     })?;
-    let Some(pca) = details.pca else {
+    let Some(PreTransform::Pca(pca)) = details.pre_transform else {
         return Ok(None);
     };
     if pca.dimension == 0 {
@@ -475,7 +478,7 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
     };
 
     apply_runtime_hints(&d.runtime_hints, &mut params);
-    if d.pca.is_some() {
+    if d.pre_transform.is_some() {
         let (pca, _) = pca_params_from_details(details).ok()??;
         params = params.with_pca(pca);
     }
@@ -762,7 +765,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
-        pca: None,
+        pre_transform: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -902,7 +905,7 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
-        pca: None,
+        pre_transform: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -952,7 +955,7 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
-            pca: None,
+            pre_transform: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -1102,7 +1105,7 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
-                pca: None,
+                pre_transform: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
@@ -1136,7 +1139,7 @@ mod tests {
             hnsw_index_config: None,
             compression: None,
             runtime_hints: Default::default(),
-            pca: Some(PcaParameters {
+            pre_transform: Some(PreTransform::Pca(PcaParameters {
                 dimension,
                 random_rotation: true,
                 whitening: true,
@@ -1146,7 +1149,7 @@ mod tests {
                 sampling_seed: 7,
                 rotation_seed: 11,
                 model_fingerprint: fingerprint,
-            }),
+            })),
         };
         prost_types::Any::from_msg(&details).unwrap()
     }

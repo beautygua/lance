@@ -231,10 +231,12 @@ message VectorIndexDetails {
    */
   map<string, string> runtime_hints = 9;
 
-  // Optional PCA pre-transform configuration. Present means vectors are
-  // transformed by the referenced trained PCA model before indexing; absent
-  // means vectors are indexed in their original dimension.
-  optional PcaParameters pca = 10;
+  // Optional vector pre-transform. Present means vectors are transformed by
+  // the referenced trained model before indexing; absent means vectors are
+  // indexed in their original dimension. An index applies at most one.
+  oneof pre_transform {
+    PcaParameters pca = 10;
+  }
 }
 
 // Parameters and trained-model identity for a PCA vector pre-transform.
