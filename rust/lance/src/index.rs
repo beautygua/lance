@@ -3127,9 +3127,9 @@ impl DatasetIndexInternalExt for Dataset {
         // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
         fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
             ivf: IVFIndex<S, Q>,
-        ) -> Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> {
+        ) -> (Arc<dyn VectorIndex>, Option<IvfStateEntryBox>) {
             let entry = ivf.to_state_entry();
-            Ok((Arc::new(ivf), Some(entry)))
+            (Arc::new(ivf), Some(entry))
         }
 
         // the index file is in lance format since version (0,2)
@@ -3227,7 +3227,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf)
+                            Ok(wrap_ivf(ivf))
                         }
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
@@ -3240,7 +3240,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf)
+                            Ok(wrap_ivf(ivf))
                         }
                         _ => Err(Error::index(format!(
                             "the field type {} is not supported for FLAT index",
@@ -3259,7 +3259,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     "IVF_SQ" => {
@@ -3273,7 +3273,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     "IVF_RQ" => {
@@ -3287,7 +3287,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     "IVF_HNSW_FLAT" => match element_type {
@@ -3302,7 +3302,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf)
+                            Ok(wrap_ivf(ivf))
                         }
                         _ => {
                             let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
@@ -3315,7 +3315,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 file_sizes,
                             )
                             .await?;
-                            wrap_ivf(ivf)
+                            Ok(wrap_ivf(ivf))
                         }
                     },
 
@@ -3330,7 +3330,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     "IVF_HNSW_PQ" => {
@@ -3344,7 +3344,7 @@ impl DatasetIndexInternalExt for Dataset {
                             file_sizes,
                         )
                         .await?;
-                        wrap_ivf(ivf)
+                        Ok(wrap_ivf(ivf))
                     }
 
                     _ => Err(Error::index(format!(
