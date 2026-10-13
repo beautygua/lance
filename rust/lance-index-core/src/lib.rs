@@ -42,6 +42,13 @@ pub trait Index: Send + Sync + DeepSizeOf {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap>;
 }
 
+/// Manifest version written for vector indices built with a vector
+/// pre-transform (for example PCA).
+///
+/// Readers older than this version must skip such indices because their query
+/// vectors need to be transformed before search.
+pub const VECTOR_PRE_TRANSFORM_INDEX_VERSION: u32 = 3;
+
 /// Index Type
 ///
 /// Do not add further entries to this enum except as a last resort.  We are attempting
@@ -293,6 +300,7 @@ impl IndexType {
         .map(|index_type| index_type.version() as u32)
         .max()
         .unwrap_or(1)
+        .max(VECTOR_PRE_TRANSFORM_INDEX_VERSION)
     }
 
     pub fn matches_details(&self, details: &prost_types::Any) -> bool {
