@@ -108,9 +108,14 @@ pub fn new_ivf_transformer_with_pre_transform(
             sq,
             range,
         )),
-        Quantizer::Rabit(rq) => {
-            IvfTransformer::with_rq(centroids, metric_type, vector_column, rq, range, pre_transform)
-        }
+        Quantizer::Rabit(rq) => IvfTransformer::with_rq(
+            centroids,
+            metric_type,
+            vector_column,
+            rq,
+            range,
+            pre_transform,
+        ),
     }
 }
 

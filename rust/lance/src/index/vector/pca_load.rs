@@ -378,7 +378,9 @@ impl CacheKey for PreTransformIndexStateCacheKey<'_> {
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
-        Some(lance_core::cache::CacheCodec::from_impl::<PreTransformIndexState>())
+        Some(lance_core::cache::CacheCodec::from_impl::<
+            PreTransformIndexState,
+        >())
     }
 }
 
@@ -451,7 +453,11 @@ impl<'a> DeclaredPreTransform<'a> {
         physical_index_type: &str,
     ) -> Result<Option<Arc<PcaModel>>> {
         let model = read_pre_transform(reader).await?;
-        validate_pca_manifest_and_model(self.index_meta, Some(physical_index_type), model.as_ref())?;
+        validate_pca_manifest_and_model(
+            self.index_meta,
+            Some(physical_index_type),
+            model.as_ref(),
+        )?;
         Ok(model)
     }
 

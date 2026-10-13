@@ -3316,7 +3316,11 @@ async fn sample_ivf_training_chunk(
     } else {
         (training_data, metric_type)
     };
-    apply_training_pre_transform(filter_finite_training_data(training_data)?, mt, pre_transform)
+    apply_training_pre_transform(
+        filter_finite_training_data(training_data)?,
+        mt,
+        pre_transform,
+    )
 }
 
 fn ensure_pre_transform_training_l2(metric_type: MetricType) -> Result<()> {
