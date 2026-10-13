@@ -672,13 +672,14 @@ async fn prepare_vector_segment_build(
     Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
 }
 
-/// First-period combination guard. Rejects unsupported PCA builds before any index files are written.
+/// The single check of which PCA builds are supported, run before any index
+/// files are written. `full_new_build` is false for empty, fragment-limited
+/// and incremental builds.
 fn validate_pca_build_supported(
     params: &VectorIndexParams,
     vector_type: &DataType,
     input_dimension: usize,
-    fragment_ids: Option<&[u32]>,
-    is_incremental: bool,
+    full_new_build: bool,
 ) -> Result<()> {
     let Some(pca) = params.pca_params() else {
         return Ok(());
@@ -727,9 +728,9 @@ fn validate_pca_build_supported(
             pca.dimension
         )));
     }
-    if fragment_ids.is_some() || is_incremental {
+    if !full_new_build {
         return Err(Error::not_supported(
-            "PCA IVF_RQ is only supported for a full new local build".to_string(),
+            "PCA IVF_RQ is only supported for a full new local build with train=true and without fragment_ids".to_string(),
         ));
     }
     let StageParams::Ivf(ivf) = &params.stages[0] else {
@@ -1468,14 +1469,6 @@ pub(crate) async fn build_vector_index_incremental(
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<VectorIndexBuildSummary> {
-    let (vector_type, _) = get_vector_type(dataset.schema(), column)?;
-    validate_pca_build_supported(
-        params,
-        &vector_type,
-        utils::get_vector_dim(dataset.schema(), column)?,
-        None,
-        true,
-    )?;
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -1732,11 +1725,6 @@ pub(crate) async fn build_empty_vector_index(
     _uuid: Uuid,
     params: &VectorIndexParams,
 ) -> Result<Vec<IndexFile>> {
-    if params.pca_params().is_some() {
-        return Err(Error::not_supported(
-            "PCA IVF_RQ requires train=true for a full new local build".to_string(),
-        ));
-    }
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed
     Err(Error::not_supported_source(
@@ -2035,6 +2023,14 @@ pub async fn initialize_vector_index(
 
     // Vector indices currently support only single fields, use the first one
     let column_name = field_names[0];
+
+    if let Some(details) = source_index.index_details.as_deref()
+        && details::pre_transform_blocks_maintenance(details)?
+    {
+        return Err(Error::not_supported(
+            "Initializing a vector index from a source index with a pre-transform is not supported",
+        ));
+    }
 
     let source_vector_index = source_dataset
         .open_vector_index(column_name, &source_index.uuid, &NoOpMetricsCollector)
@@ -4205,7 +4201,7 @@ mod tests {
         let vector_type =
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16);
         let valid = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2).with_pca(PcaParams::new(8));
-        validate_pca_build_supported(&valid, &vector_type, 16, None, false).unwrap();
+        validate_pca_build_supported(&valid, &vector_type, 16, true).unwrap();
 
         let mut streaming = valid.clone();
         if let StageParams::Ivf(ivf) = &mut streaming.stages[0] {
@@ -4213,7 +4209,7 @@ mod tests {
             ivf.streaming_coreset_rate = Some(16);
             ivf.streaming_refine_passes = 1;
         }
-        validate_pca_build_supported(&streaming, &vector_type, 16, None, false).unwrap();
+        validate_pca_build_supported(&streaming, &vector_type, 16, true).unwrap();
 
         let unsupported = [
             VectorIndexParams::ivf_flat(4, DistanceType::L2).with_pca(PcaParams::new(8)),
@@ -4221,21 +4217,20 @@ mod tests {
             VectorIndexParams::ivf_rq(4, 1, DistanceType::L2).with_pca(PcaParams::new(7)),
         ];
         for params in unsupported {
-            assert!(validate_pca_build_supported(&params, &vector_type, 16, None, false).is_err());
+            assert!(validate_pca_build_supported(&params, &vector_type, 16, true).is_err());
         }
 
         let oversized_sample = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2)
             .with_pca(PcaParams::new(8).with_sample_size(u32::MAX as usize + 1));
-        let error = validate_pca_build_supported(&oversized_sample, &vector_type, 16, None, false)
-            .unwrap_err();
+        let error =
+            validate_pca_build_supported(&oversized_sample, &vector_type, 16, true).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("manifest limit"));
 
-        assert!(validate_pca_build_supported(&valid, &vector_type, 16, Some(&[0]), false).is_err());
-        assert!(validate_pca_build_supported(&valid, &vector_type, 16, None, true).is_err());
+        assert!(validate_pca_build_supported(&valid, &vector_type, 16, false).is_err());
 
         let multivector = DataType::List(Arc::new(Field::new("item", vector_type, true)));
-        assert!(validate_pca_build_supported(&valid, &multivector, 16, None, false).is_err());
+        assert!(validate_pca_build_supported(&valid, &multivector, 16, true).is_err());
     }
 
     #[tokio::test]
@@ -4255,6 +4250,7 @@ mod tests {
             Uuid::new_v4(),
             &params,
             None,
+            true,
             noop_progress(),
         )
         .await

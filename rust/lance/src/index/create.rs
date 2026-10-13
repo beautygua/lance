@@ -484,27 +484,17 @@ impl<'a> CreateIndexBuilder<'a> {
                         Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
                 let index_version = vec_params.compatibility_version();
-                if vec_params.pca_params().is_some() && self.fragments.is_some() {
-                    return Err(Error::not_supported(
-                        "PCA IVF_RQ is only supported for a full new local build without fragment_ids"
-                            .to_string(),
-                    ));
-                }
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
                 let (files, pca_fingerprint) = if vec_params.pca_params().is_some() {
-                    if !train || effective_fragments.is_some() {
-                        return Err(Error::not_supported(
-                            "PCA IVF_RQ is only supported for a full new local build".to_string(),
-                        ));
-                    }
                     let summary = Box::pin(build_pca_ivf_rq_index(
                         self.dataset,
                         column,
                         index_id,
                         vec_params,
                         fri,
+                        train && self.fragments.is_none(),
                         self.progress.clone(),
                     ))
                     .await?;

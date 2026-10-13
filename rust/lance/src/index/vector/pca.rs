@@ -307,11 +307,12 @@ pub(crate) async fn build_pca_ivf_rq_index(
     uuid: uuid::Uuid,
     params: &super::VectorIndexParams,
     frag_reuse_index: Option<Arc<lance_index::frag_reuse::CompactFragReuseIndex>>,
+    full_new_build: bool,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<super::builder::VectorIndexBuildSummary> {
     let (vector_type, _) = super::utils::get_vector_type(dataset.schema(), column)?;
     let input_dimension = get_vector_dim(dataset.schema(), column)?;
-    super::validate_pca_build_supported(params, &vector_type, input_dimension, None, false)?;
+    super::validate_pca_build_supported(params, &vector_type, input_dimension, full_new_build)?;
     let pca_params = params.pca_params().cloned().ok_or_else(|| {
         Error::invalid_input("PCA IVF_RQ build requires PCA parameters".to_string())
     })?;
