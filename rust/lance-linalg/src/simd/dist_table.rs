@@ -24,6 +24,7 @@ pub const SAFE_U16_CODE_LEN: usize = 128;
 enum DistTableBackend {
     Avx512,
     Avx2,
+    Sve,
     Neon,
     Scalar,
 }
@@ -39,11 +40,17 @@ enum DistTableBackend {
 /// with no `kernel_support` cfg, the exact `f32` entry points pass `true` on
 /// every build since only an x86_64 tier can select it, and the hacc entry
 /// point has none.
+///
+/// `sve_kernel` is the same contract for the 256-bit SVE fast-scan, which only
+/// `sum_4bit_dist_table_uninit` offers. `sve_vl32` is true when that kernel was
+/// compiled and `svcntb() == 32`. Other vector lengths stay on NEON.
 fn dist_table_backend(
     support: SimdSupport,
     avx512_kernel: bool,
     has_avx512bw: bool,
     has_avx2: bool,
+    sve_kernel: bool,
+    sve_vl32: bool,
 ) -> DistTableBackend {
     match support {
         SimdSupport::Avx512 | SimdSupport::Avx512FP16 if avx512_kernel && has_avx512bw => {
@@ -56,9 +63,28 @@ fn dist_table_backend(
         SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2 if has_avx2 => {
             DistTableBackend::Avx2
         }
+        // A 950-class core reports `Neon` and also has 256-bit SVE. Entry
+        // points without an SVE kernel must keep NEON; returning `Sve` there
+        // would fall through to scalar.
+        SimdSupport::Neon if sve_kernel && sve_vl32 => DistTableBackend::Sve,
         SimdSupport::Neon => DistTableBackend::Neon,
         _ => DistTableBackend::Scalar,
     }
+}
+
+/// True when the SVE fast-scan was compiled and this core's SVE vector is
+/// 32 bytes. The C helper is an `svcntb`, so it runs only after `sve` is
+/// visible in HWCAP.
+#[inline]
+fn sve_dist_table_vl32() -> bool {
+    #[cfg(all(kernel_support = "sve_dist_table", target_arch = "aarch64"))]
+    {
+        if std::arch::is_aarch64_feature_detected!("sve") {
+            // SAFETY: HWCAP_SVE is set, so `svcntb` is legal.
+            return unsafe { lance_sve_cntb() == 32 };
+        }
+    }
+    false
 }
 
 /// The two feature bits [`dist_table_backend`] needs, or `false` off x86_64.
@@ -142,6 +168,8 @@ pub unsafe fn sum_4bit_dist_table_uninit(
         )),
         has_avx512bw,
         has_avx2,
+        cfg!(all(kernel_support = "sve_dist_table", target_arch = "aarch64")),
+        sve_dist_table_vl32(),
     ) {
         #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
         DistTableBackend::Avx512 => {
@@ -167,6 +195,20 @@ pub unsafe fn sum_4bit_dist_table_uninit(
                 )
             }
         },
+        #[cfg(all(kernel_support = "sve_dist_table", target_arch = "aarch64"))]
+        DistTableBackend::Sve => {
+            for i in (0..n).step_by(BATCH_SIZE) {
+                let codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
+                unsafe {
+                    sum_4bit_dist_table_32bytes_batch_sve(
+                        codes.as_ptr(),
+                        codes.len(),
+                        dist_table.as_ptr(),
+                        dists[i..i + BATCH_SIZE].as_mut_ptr().cast::<u16>(),
+                    )
+                }
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         DistTableBackend::Neon => unsafe {
             for i in (0..n).step_by(BATCH_SIZE) {
@@ -394,7 +436,7 @@ pub unsafe fn sum_4bit_hacc_dist_table_uninit(
     // aarch64 tier is `Neon` or `None`, so the selector returns `Neon` or
     // `Scalar` and both land on the scalar `_` arm.
     let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    match dist_table_backend(*SIMD_SUPPORT, false, has_avx512bw, has_avx2) {
+    match dist_table_backend(*SIMD_SUPPORT, false, has_avx512bw, has_avx2, false, false) {
         #[cfg(target_arch = "x86_64")]
         DistTableBackend::Avx2 => {
             sum_4bit_hacc_dist_table_avx2(n, code_len, codes, hacc_dist_table, dists);
@@ -830,6 +872,8 @@ pub fn sum_4bit_dist_table_transposed(
         cfg!(target_arch = "x86_64"),
         has_avx512bw,
         has_avx2,
+        false,
+        false,
     ) {
         #[cfg(target_arch = "x86_64")]
         DistTableBackend::Avx512 => {
@@ -956,6 +1000,8 @@ pub fn filter_4bit_dist_table_transposed(
         cfg!(target_arch = "x86_64"),
         has_avx512bw,
         has_avx2,
+        false,
+        false,
     );
     // `Avx512` needs `avx512bw`, which implies the `avx512f` its kernel also
     // uses, and `Avx2` needs `avx2`.
@@ -1610,7 +1656,7 @@ pub fn sum_4bit_dist_table_f32_transposed(
     dists: &mut [f32],
 ) {
     let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    let backend = dist_table_backend(*SIMD_SUPPORT, true, has_avx512bw, has_avx2);
+    let backend = dist_table_backend(*SIMD_SUPPORT, true, has_avx512bw, has_avx2, false, false);
     // `Avx512` needs `avx512bw`, which implies the `avx512f` its kernel uses,
     // and `Avx2` needs `avx2`.
     unsafe { sum_f32_transposed_with_backend(backend, n, code_len, codes, dist_table, dists) };
@@ -1650,7 +1696,7 @@ pub fn sum_4bit_dist_table_f32_rows(
     dists: &mut [f32],
 ) {
     let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    let backend = dist_table_backend(*SIMD_SUPPORT, true, has_avx512bw, has_avx2);
+    let backend = dist_table_backend(*SIMD_SUPPORT, true, has_avx512bw, has_avx2, false, false);
     // Same backend contract as `sum_4bit_dist_table_f32_transposed`.
     unsafe { sum_f32_rows_with_backend(backend, n, code_len, codes, dist_table, rows, dists) };
 }
@@ -2281,9 +2327,22 @@ unsafe fn sum_f32_transposed_block_neon<const GROUPS: usize>(
 
 // We implement the AVX512 version in C because AVX512 is not stable yet in Rust,
 // implement it in Rust once we upgrade rust to 1.89.0.
+// The SVE fast-scan is C for the same reason: `std::arch::aarch64` SVE
+// intrinsics are not used here.
 unsafe extern "C" {
     #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
     pub fn sum_4bit_dist_table_32bytes_batch_avx512(
+        codes: *const u8,
+        code_length: usize,
+        dist_table: *const u8,
+        dists: *mut u16,
+    );
+
+    #[cfg(all(kernel_support = "sve_dist_table", target_arch = "aarch64"))]
+    fn lance_sve_cntb() -> usize;
+
+    #[cfg(all(kernel_support = "sve_dist_table", target_arch = "aarch64"))]
+    fn sum_4bit_dist_table_32bytes_batch_sve(
         codes: *const u8,
         code_length: usize,
         dist_table: *const u8,
@@ -2364,8 +2423,35 @@ mod tests {
         #[case] expected: DistTableBackend,
     ) {
         assert_eq!(
-            dist_table_backend(support, avx512_kernel, has_avx512bw, has_avx2),
+            dist_table_backend(support, avx512_kernel, has_avx512bw, has_avx2, false, false),
             expected
+        );
+    }
+
+    /// SVE is only the 32-byte fast-scan on a NEON host. A shorter or longer
+    /// vector, or an entry point that did not compile the C kernel, stays on
+    /// NEON. x86 tiers ignore the SVE bits.
+    #[rstest::rstest]
+    #[case::vl32(true, true, DistTableBackend::Sve)]
+    #[case::kernel_without_vl32(true, false, DistTableBackend::Neon)]
+    #[case::vl32_without_kernel(false, true, DistTableBackend::Neon)]
+    #[case::neither(false, false, DistTableBackend::Neon)]
+    fn sve_fast_scan_requires_a_32_byte_vector(
+        #[case] sve_kernel: bool,
+        #[case] sve_vl32: bool,
+        #[case] expected: DistTableBackend,
+    ) {
+        assert_eq!(
+            dist_table_backend(SimdSupport::Neon, false, false, false, sve_kernel, sve_vl32),
+            expected
+        );
+    }
+
+    #[test]
+    fn sve_fast_scan_does_not_override_avx2() {
+        assert_eq!(
+            dist_table_backend(SimdSupport::Avx2, true, false, true, true, true),
+            DistTableBackend::Avx2
         );
     }
 

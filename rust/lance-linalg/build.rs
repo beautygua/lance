@@ -17,13 +17,14 @@ fn main() -> Result<(), String> {
 
     // Let clippy know about our custom cfg attribute
     println!(
-        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
+        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"sve_dist_table\", \"amx_fp16\"))"
     );
     println!("cargo::rustc-check-cfg=cfg(simd_fallback)");
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/bf16.c");
     println!("cargo:rerun-if-changed=src/simd/dist_table.c");
+    println!("cargo:rerun-if-changed=src/simd/dist_table_sve.c");
     println!("cargo:rerun-if-changed=src/simd/amx_fp16.c");
     println!("cargo:rerun-if-env-changed=LANCE_AMX_FP16_CC");
 
@@ -58,6 +59,16 @@ fn main() -> Result<(), String> {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
         build_bf16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
+        // 256-bit SVE fast-scan. A compiler without `<arm_sve.h>` skips it and
+        // the Rust side stays on the NEON kernel.
+        if let Err(err) = build_dist_table_sve() {
+            println!(
+                "cargo:warning=Skipping build of SVE dist_table. Error: {}",
+                err
+            );
+        } else {
+            println!("cargo:rustc-cfg=kernel_support=\"sve_dist_table\"");
+        }
     } else if target_arch == "x86_64" {
         // Build a version with AVX512
         if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids", "-mavx512fp16"])
@@ -213,6 +224,18 @@ fn build_bf16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> 
     }
 
     builder.try_compile(&format!("bf16_{}", suffix))
+}
+
+fn build_dist_table_sve() -> Result<(), cc::Error> {
+    let mut builder = cc::Build::new();
+    builder
+        .std("c17")
+        .file("src/simd/dist_table_sve.c")
+        .flag("-O3")
+        .flag("-Wall")
+        .flag("-Wextra")
+        .flag("-march=armv8-a+sve");
+    builder.try_compile("dist_table_sve")
 }
 
 fn build_dist_table_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
