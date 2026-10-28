@@ -81,7 +81,8 @@ enum CompressionDetailsJson {
     },
 }
 
-fn vector_index_details_proto(params: &VectorIndexParams) -> VectorIndexDetails {
+/// Build a `VectorIndexDetails` proto from build params at index creation time.
+pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     let metric_type = match params.metric_type {
         lance_linalg::distance::DistanceType::L2 => VectorMetricType::L2,
         lance_linalg::distance::DistanceType::Cosine => VectorMetricType::Cosine,
@@ -154,19 +155,15 @@ fn vector_index_details_proto(params: &VectorIndexParams) -> VectorIndexDetails 
 
     let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
 
-    VectorIndexDetails {
+    let details = VectorIndexDetails {
         metric_type: metric_type.into(),
         target_partition_size,
         hnsw_index_config,
         compression,
         runtime_hints,
         pre_transform: None,
-    }
-}
-
-/// Build a `VectorIndexDetails` proto from build params at index creation time.
-pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
-    prost_types::Any::from_msg(&vector_index_details_proto(params)).unwrap()
+    };
+    prost_types::Any::from_msg(&details).unwrap()
 }
 
 pub fn vector_index_details_default() -> prost_types::Any {

@@ -73,26 +73,14 @@ uses the pre-transform records index metadata version 3 so older readers skip
 it. The IVF_RQ quantization format itself is unchanged. The source dataset is
 not rewritten; dropping the feature only requires rebuilding the index.
 
-### Parameters
-
-`VectorIndexDetails.pre_transform.pca` is a `PcaParameters` message:
-
-```protobuf
-%%% proto.message.PcaParameters %%%
-```
-
-`dimension` is the projected dimension and must be non-zero. `sample_size` is
-the target number of valid training rows. `sampling_seed` selects those rows.
-`model_fingerprint` is required and contains exactly 32 raw bytes. This
-message does not store whitening, an epsilon, a random rotation, a rotation
-seed, or a training memory budget. A reader must not infer any of those from
-a missing protobuf number.
+`VectorIndexDetails.pre_transform.pca` is an empty `PcaPreTransform` marker.
+Its presence declares that the index uses the model stored below.
 
 ### Model file
 
-The trained model is not stored in `PcaParameters`. It is one global buffer in
-the index file `index.idx`, not in `auxiliary.idx`. The Arrow schema metadata
-key is `lance:pca`. Its value is the decimal text of the one-based global
+The trained model is one global buffer in the index file `index.idx`, not in
+`auxiliary.idx`. The Arrow schema metadata key is `lance:pca`. Its value is
+the decimal text of the one-based global
 buffer index returned when that buffer was written, the same numbering as
 `lance:ivf`. The index is not fixed. The file container must be legacy
 container `(0, 3)` or file version 2.x, because those containers can store
@@ -110,8 +98,9 @@ and shape `[output_dimension, input_dimension]`, stored row-major.
 `mean` has rank 1 and shape `[input_dimension]`. No dimension may be zero.
 `data` length must equal the product of the shape times 4. Every value must
 be finite. `mean` length must equal the matrix column count.
-`output_dimension` must equal `PcaParameters.dimension`, and must be strictly
-less than `input_dimension`.
+`input_dimension` must equal the indexed vector column's dimension.
+`output_dimension` must be strictly less than `input_dimension` and must equal
+the IVF centroid dimension and the input dimension of the RQ quantizer.
 
 ### Projection
 
@@ -128,30 +117,10 @@ index and for query vectors. The file stores that matrix directly and does not
 store a separate rotation matrix. Rows of `A` are not rescaled, so this
 version does not whiten the projection.
 
-### Fingerprint
-
-`model_fingerprint` is the BLAKE3-256 digest of the stored transform, not of
-the training parameters. The hashed bytes, in order, are:
-
-1. The ASCII domain separator `lance-vector-pre-transform:pca:v1`, with no
-   trailing NUL.
-2. `model_version` as a 4-byte little-endian unsigned integer. For version 1
-   these bytes are `01 00 00 00`.
-3. Each `float32` of `transform_matrix`, in stored row-major order, then each
-   `float32` of `mean`. Each value is 4 little-endian IEEE-754 bytes. Negative
-   zero is canonicalized to positive zero before it is hashed. Every other
-   finite value is hashed unchanged.
-
-The digest is 32 bytes. Index details that render the fingerprint as text use
-the prefix `blake3:` followed by 64 lowercase hexadecimal digits. That text is
-not what is hashed and is not what the protobuf stores.
-
-Index metadata version 3 requires `PcaParameters`, the 32-byte fingerprint, the
-`lance:pca` metadata key, and the model buffer, and the physical index type
-must be `IVF_RQ`. On load, the fingerprint recomputed from the buffer must
-equal the manifest bytes, and the matrix row count must equal `dimension`.
-Any other index metadata version must not declare PCA parameters and must not
-contain `lance:pca` or the model buffer. A mismatch is a corrupt index.
+Index metadata version 3 requires the PCA marker, the `lance:pca` metadata
+key, and the model buffer, and the physical index type must be `IVF_RQ`.
+Any other index metadata version must not declare PCA and must not contain
+`lance:pca` or the model buffer. A mismatch is a corrupt index.
 
 ## Storage Layout (V3)
 

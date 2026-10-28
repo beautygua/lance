@@ -95,6 +95,8 @@ pub fn infer_system_index_type(
 
 #[cfg(test)]
 mod tests {
+    use prost::Message;
+
     use super::*;
 
     #[test]
@@ -107,6 +109,29 @@ mod tests {
     fn test_max_vector_version_tracks_highest_supported() {
         assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
         const { assert!(VECTOR_PRE_TRANSFORM_INDEX_VERSION > IVF_RQ_INDEX_VERSION) };
+    }
+
+    #[test]
+    fn test_pca_marker_round_trip() {
+        let details = pb::VectorIndexDetails {
+            pre_transform: Some(pb::vector_index_details::PreTransform::Pca(
+                pb::PcaPreTransform {},
+            )),
+            ..Default::default()
+        };
+        let encoded = details.encode_to_vec();
+        // An empty message still records presence at field 10.
+        assert_eq!(encoded, [0x52, 0x00]);
+        assert_eq!(
+            pb::VectorIndexDetails::decode(encoded.as_slice()).unwrap(),
+            details
+        );
+        assert!(
+            pb::VectorIndexDetails::decode(&[][..])
+                .unwrap()
+                .pre_transform
+                .is_none()
+        );
     }
 
     #[test]
