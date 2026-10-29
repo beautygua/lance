@@ -53,6 +53,12 @@ The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
+`index_version` also tracks the row domain of the auxiliary file's `_rowid`
+or `_rowaddr` column. From version 3 onward, a segment stores the physical row
+address (`fragment_id << 32 | offset`) of each vector in `_rowaddr` instead of the
+dataset's logical row id in `_rowid`. A segment persisted below version 3 stores
+row ids throughout, and merging never combines segments of differing domain.
+
 ## PCA Pre-transform
 
 !!! warning "Experimental"
@@ -66,11 +72,12 @@ The specific version of the vector index is recorded in the `index_version` fiel
 An `IVF_RQ` index may store one PCA pre-transform. The index metric must be
 L2. Cosine and dot are not defined for this pre-transform. Both indexed vectors
 and query vectors are projected by the stored model before IVF and quantization.
-An index that uses the pre-transform records index metadata version 3 so older
-readers skip it. IVF_RQ indices without PCA keep index metadata version 2 and
-index vectors in their original dimension. The IVF_RQ quantization format
-itself is unchanged. The source dataset is not rewritten; dropping the feature
-only requires rebuilding the index.
+An index that uses the pre-transform records index metadata version 4 so readers
+that do not support PCA skip it. Version 4 retains the row-address domain
+introduced by version 3. IVF_RQ indices without PCA keep their existing index
+metadata version and index vectors in their original dimension. The IVF_RQ
+quantization format itself is unchanged. The source dataset is not rewritten;
+dropping the feature only requires rebuilding the index.
 
 ### Model file
 
@@ -112,7 +119,7 @@ index and for query vectors. The file stores that matrix directly and does not
 store a separate rotation matrix. Rows of `A` are not rescaled, so this
 version does not whiten the projection.
 
-Index metadata version 3 requires the `lance:pca` metadata key and the model
+Index metadata version 4 requires the `lance:pca` metadata key and the model
 buffer, and the physical index type must be `IVF_RQ`. Any other index metadata
 version must not contain `lance:pca` or the model buffer. A mismatch is a corrupt
 index.
@@ -242,10 +249,11 @@ on that ordering to identify them.
 
 No quantization applied - stores original vectors in their full precision:
 
-| Column   | Type                     | Nullable | Description                                           |
-| -------- | ------------------------ | -------- | ----------------------------------------------------- |
-| `_rowid` | uint64                   | true     | Row identifier                                        |
-| `flat`   | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
+| Column     | Type                     | Nullable | Description                                           |
+| ---------- | ------------------------ | -------- | ----------------------------------------------------- |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
+| `flat`     | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
 
 ##### PQ
 
@@ -253,7 +261,8 @@ Compresses vectors using product quantization for significant memory savings:
 
 | Column      | Type                                            | Nullable | Description                                   |
 | ----------- | ----------------------------------------------- | -------- | --------------------------------------------- |
-| `_rowid`    | uint64                                          | true     | Row identifier                                |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
 | `__pq_code` | list<uint8>[num_sub_vectors * num_bits / 8]     | true     | PQ codes, packed to `num_bits` per subvector  |
 
 ##### SQ
@@ -262,7 +271,8 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 | Column      | Type                   | Nullable | Description                             |
 | ----------- | ---------------------- | -------- | --------------------------------------- |
-| `_rowid`    | uint64                 | true     | Row identifier                          |
+| `_rowid`    | uint64                 | true     | Row identifier (present when version <= 2) |
+| `_rowaddr`  | uint64                 | true     | Row address (present when version >= 3) |
 | `__sq_code` | list<uint8>[dimension] | true     | SQ codes (list_size = vector dimension) |
 
 ##### RQ
@@ -271,7 +281,7 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 
 | Column               | Type                                             | Nullable | Present when                | Description                                                     |
 | -------------------- | ------------------------------------------------ | -------- | --------------------------- | --------------------------------------------------------------- |
-| `_rowid`             | uint64                                           | true     | always                      | Row identifier                                                  |
+| `_rowid`             | uint64                                           | true     | always                      | Row identifier (a physical row address from 3 onward; a row id in a segment persisted at version <= 2) |
 | `_rabit_codes`       | list<uint8>[ceil(code_dim / 8)]                  | true     | always                      | Binary quantized codes (1 bit per dimension, packed into bytes) |
 | `__add_factors`      | float32                                          | true     | always                      | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | true     | always                      | Scale correction factors for distance computation               |
