@@ -14,9 +14,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use lance_file::reader::FileReaderOptions;
+use lance_index::pb::VectorIndexDetails;
+use lance_index::pb::VectorMetricType;
 use lance_index::pb::index::Implementation;
 use lance_index::pb::vector_index_details::{Compression, FlatCompression, rabit_quantization};
-use lance_index::pb::{VectorIndexDetails, VectorMetricType};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -161,7 +162,6 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
-        pre_transform: None,
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -564,7 +564,6 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
-        pre_transform: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -704,7 +703,6 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
-        pre_transform: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -754,7 +752,6 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
-            pre_transform: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -904,7 +901,6 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
-                pre_transform: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };

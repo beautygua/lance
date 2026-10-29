@@ -230,27 +230,7 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
-
-  /* EXPERIMENTAL: optional vector pre-transform. Present means vectors are
-   * transformed by the referenced trained model before indexing; absent means
-   * vectors are indexed in their original dimension. An index applies at most
-   * one. See PcaPreTransform. Datasets that do not set this field are unaffected.
-   */
-  oneof pre_transform {
-    PcaPreTransform pca = 10;
-  }
 }
-
-/*
- * EXPERIMENTAL: declares a PCA pre-transform whose model is stored in
- * index.idx and located by the lance:pca schema metadata key.
- * This message and the stored model may change incompatibly without a
- * separate vote, in which case the index must be rebuilt (the data is never
- * rewritten), and the feature is removed if its stabilization vote does not
- * pass. Datasets that do not use the pre-transform are not affected either
- * way.
- */
-message PcaPreTransform {}
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
 message HnswParameters {

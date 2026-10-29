@@ -57,34 +57,29 @@ The specific version of the vector index is recorded in the `index_version` fiel
 
 !!! warning "Experimental"
 
-    PCA as a vector pre-transform is an experimental format feature. Its
-    details message and stored model may change incompatibly without a
-    separate vote; after such a change the index must be rebuilt, and the
-    data itself is never rewritten. The feature is removed if its
-    stabilization vote does not pass. Indexes that do not use a pre-transform
-    are unaffected.
+    PCA as a vector pre-transform is an experimental format feature. The
+    stored model may change incompatibly without a separate vote; after
+    such a change the index must be rebuilt, and the data itself is never
+    rewritten. The feature is removed if its stabilization vote does not pass.
+    Indices that do not use a pre-transform are unaffected.
 
 An `IVF_RQ` index may store one PCA pre-transform. The index metric must be
-L2. Cosine and dot are not defined for this pre-transform. When
-`VectorIndexDetails.pre_transform` is absent, vectors are indexed in their
-original dimension. When it is present, both indexed vectors and query vectors
-are projected by the stored model before IVF and quantization. An index that
-uses the pre-transform records index metadata version 3 so older readers skip
-it. The IVF_RQ quantization format itself is unchanged. The source dataset is
-not rewritten; dropping the feature only requires rebuilding the index.
-
-`VectorIndexDetails.pre_transform.pca` is an empty `PcaPreTransform` marker.
-Its presence declares that the index uses the model stored below.
+L2. Cosine and dot are not defined for this pre-transform. Both indexed vectors
+and query vectors are projected by the stored model before IVF and quantization.
+An index that uses the pre-transform records index metadata version 3 so older
+readers skip it. IVF_RQ indices without PCA keep index metadata version 2 and
+index vectors in their original dimension. The IVF_RQ quantization format
+itself is unchanged. The source dataset is not rewritten; dropping the feature
+only requires rebuilding the index.
 
 ### Model file
 
 The trained model is one global buffer in the index file `index.idx`, not in
 `auxiliary.idx`. The Arrow schema metadata key is `lance:pca`. Its value is
-the decimal text of the one-based global
-buffer index returned when that buffer was written, the same numbering as
-`lance:ivf`. The index is not fixed. The file container must be legacy
-container `(0, 3)` or file version 2.x, because those containers can store
-schema metadata and global buffers.
+the decimal text of the one-based global buffer index returned when that
+buffer was written, the same numbering as `lance:ivf`. The index is not fixed.
+The file container must be legacy container `(0, 3)` or file version 2.x,
+because those containers can store schema metadata and global buffers.
 
 The buffer is a protobuf `PcaModel`:
 
@@ -117,10 +112,10 @@ index and for query vectors. The file stores that matrix directly and does not
 store a separate rotation matrix. Rows of `A` are not rescaled, so this
 version does not whiten the projection.
 
-Index metadata version 3 requires the PCA marker, the `lance:pca` metadata
-key, and the model buffer, and the physical index type must be `IVF_RQ`.
-Any other index metadata version must not declare PCA and must not contain
-`lance:pca` or the model buffer. A mismatch is a corrupt index.
+Index metadata version 3 requires the `lance:pca` metadata key and the model
+buffer, and the physical index type must be `IVF_RQ`. Any other index metadata
+version must not contain `lance:pca` or the model buffer. A mismatch is a corrupt
+index.
 
 ## Storage Layout (V3)
 
