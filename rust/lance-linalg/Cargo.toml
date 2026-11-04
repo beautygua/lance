@@ -36,6 +36,12 @@ cc = "1.0.83"
 # This requires GCC 12 / Clang 6 or later. (To get AVX-512 support,
 # you need Clang 11 or later.)
 fp16kernels = []
+# aarch64 `dist_table` benchmark. With neither feature, one run times the
+# original NEON kernel and the KRL trial. Pass exactly one feature to time
+# only that kernel. `neon-dist-table-krl` alone also selects the trial kernel
+# in `sum_4bit_dist_table`.
+neon-dist-table-baseline = []
+neon-dist-table-krl = []
 
 [[bench]]
 name = "l2"

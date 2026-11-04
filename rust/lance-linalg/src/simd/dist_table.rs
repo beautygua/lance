@@ -224,16 +224,85 @@ lance_core::target_kernel! {
         code_len: usize,
         dists: &mut [MaybeUninit<u16>],
     ) {
-        let n = dists.len();
-        assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
-        for i in (0..n).step_by(BATCH_SIZE) {
-            // The bounds asserted above cover every load of the batch.
-            unsafe {
-                sum_dist_table_32bytes_batch_neon(
-                    &codes[i * code_len..(i + BATCH_SIZE) * code_len],
-                    dist_table,
-                    &mut dists[i..i + BATCH_SIZE],
-                )
+        // `--features neon-dist-table-krl` alone selects the trial kernel for
+        // this dispatched entry. Any other feature combination keeps the
+        // original NEON kernel, which matches the scalar reference.
+        const USE_KRL: bool = cfg!(all(
+            feature = "neon-dist-table-krl",
+            not(feature = "neon-dist-table-baseline"),
+        ));
+        if USE_KRL {
+            sum_neon_rows::<true>(codes, dist_table, code_len, dists);
+        } else {
+            sum_neon_rows::<false>(codes, dist_table, code_len, dists);
+        }
+    }
+}
+
+/// Original NEON [`sum_4bit_dist_table`]. The distance-table benchmark calls
+/// this beside [`sum_4bit_dist_table_neon_krl`].
+///
+/// # Panics
+///
+/// Same bounds as [`sum_4bit_dist_table_uninit`].
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn sum_4bit_dist_table_neon(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [u16],
+) {
+    let dists = unsafe {
+        std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u16>>(), dists.len())
+    };
+    sum_neon_rows::<false>(codes, dist_table, code_len, &mut dists[..n]);
+}
+
+/// KRL `vsli` / 32-byte `tbl` / `vpadal` trial of [`sum_4bit_dist_table`].
+///
+/// The stored distances do not match [`sum_4bit_dist_table_scalar`]: Lance's
+/// two subquantizers are contiguous 16-byte groups, and this kernel adds
+/// adjacent code bytes. It is a timing target for the `dist_table` benchmark.
+///
+/// # Panics
+///
+/// Same bounds as [`sum_4bit_dist_table_uninit`].
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn sum_4bit_dist_table_neon_krl(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [u16],
+) {
+    let dists = unsafe {
+        std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u16>>(), dists.len())
+    };
+    sum_neon_rows::<true>(codes, dist_table, code_len, &mut dists[..n]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn sum_neon_rows<const KRL: bool>(
+    codes: &[u8],
+    dist_table: &[u8],
+    code_len: usize,
+    dists: &mut [MaybeUninit<u16>],
+) {
+    let n = dists.len();
+    assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
+    for i in (0..n).step_by(BATCH_SIZE) {
+        let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
+        let batch_dists = &mut dists[i..i + BATCH_SIZE];
+        // The bounds asserted above cover every load of the batch.
+        unsafe {
+            if KRL {
+                sum_dist_table_32bytes_batch_neon_krl(batch_codes, dist_table, batch_dists);
+            } else {
+                sum_dist_table_32bytes_batch_neon(batch_codes, dist_table, batch_dists);
             }
         }
     }
@@ -749,16 +818,90 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(
     _mm256_storeu_si256(dists.as_mut_ptr().add(16) as *mut __m256i, dis1);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sum_dist_table_32bytes_batch_neon(
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [MaybeUninit<u16>],
+) {
+    let low_mask = vdupq_n_u8(0x0f);
+
+    // 8 accumulators: 4 per 128-bit lane (lo = bytes 0..16, hi = bytes 16..32 of each block)
+    let mut accu0_lo = vdupq_n_u16(0);
+    let mut accu1_lo = vdupq_n_u16(0);
+    let mut accu2_lo = vdupq_n_u16(0);
+    let mut accu3_lo = vdupq_n_u16(0);
+    let mut accu0_hi = vdupq_n_u16(0);
+    let mut accu1_hi = vdupq_n_u16(0);
+    let mut accu2_hi = vdupq_n_u16(0);
+    let mut accu3_hi = vdupq_n_u16(0);
+
+    let codes_ptr = codes.as_ptr();
+    let dt_ptr = dist_table.as_ptr();
+
+    for i in (0..codes.len()).step_by(32) {
+        // Process lo lane: bytes [i..i+16]
+        let c_lo = vld1q_u8(codes_ptr.add(i));
+        let lut_lo = vld1q_u8(dt_ptr.add(i));
+
+        let lo_lo = vandq_u8(c_lo, low_mask);
+        let hi_lo = vshrq_n_u8::<4>(c_lo);
+
+        let res_lo_lo = vqtbl1q_u8(lut_lo, lo_lo);
+        let res_hi_lo = vqtbl1q_u8(lut_lo, hi_lo);
+
+        accu0_lo = vaddq_u16(accu0_lo, vreinterpretq_u16_u8(res_lo_lo));
+        accu1_lo = vaddq_u16(accu1_lo, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_lo_lo)));
+        accu2_lo = vaddq_u16(accu2_lo, vreinterpretq_u16_u8(res_hi_lo));
+        accu3_lo = vaddq_u16(accu3_lo, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_hi_lo)));
+
+        // Process hi lane: bytes [i+16..i+32]
+        let c_hi = vld1q_u8(codes_ptr.add(i + 16));
+        let lut_hi = vld1q_u8(dt_ptr.add(i + 16));
+
+        let lo_hi = vandq_u8(c_hi, low_mask);
+        let hi_hi = vshrq_n_u8::<4>(c_hi);
+
+        let res_lo_hi = vqtbl1q_u8(lut_hi, lo_hi);
+        let res_hi_hi = vqtbl1q_u8(lut_hi, hi_hi);
+
+        accu0_hi = vaddq_u16(accu0_hi, vreinterpretq_u16_u8(res_lo_hi));
+        accu1_hi = vaddq_u16(accu1_hi, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_lo_hi)));
+        accu2_hi = vaddq_u16(accu2_hi, vreinterpretq_u16_u8(res_hi_hi));
+        accu3_hi = vaddq_u16(accu3_hi, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_hi_hi)));
+    }
+
+    // Merge: clean even bytes by subtracting the odd-byte bleed
+    accu0_lo = vsubq_u16(accu0_lo, vshlq_n_u16::<8>(accu1_lo));
+    accu0_hi = vsubq_u16(accu0_hi, vshlq_n_u16::<8>(accu1_hi));
+
+    // Cross-lane merge: add lo and hi lane accumulators
+    // This is the NEON equivalent of AVX2's permute2f128 + blend + add
+    let dis0_even = vaddq_u16(accu0_lo, accu0_hi);
+    let dis0_odd = vaddq_u16(accu1_lo, accu1_hi);
+    vst1q_u16(dists.as_mut_ptr().cast::<u16>(), dis0_even);
+    vst1q_u16(dists.as_mut_ptr().add(8).cast::<u16>(), dis0_odd);
+
+    // Same for hi-nibble accumulators (vectors 16..31)
+    accu2_lo = vsubq_u16(accu2_lo, vshlq_n_u16::<8>(accu3_lo));
+    accu2_hi = vsubq_u16(accu2_hi, vshlq_n_u16::<8>(accu3_hi));
+
+    let dis1_even = vaddq_u16(accu2_lo, accu2_hi);
+    let dis1_odd = vaddq_u16(accu3_lo, accu3_hi);
+    vst1q_u16(dists.as_mut_ptr().add(16).cast::<u16>(), dis1_even);
+    vst1q_u16(dists.as_mut_ptr().add(24).cast::<u16>(), dis1_odd);
+}
+
 // Performance trial of the KRL fast-scan sequence (`vsli`/`vsri`, 32-byte `tbl`,
 // `vpadal`). Odd code bytes are looked up in the second half of the table and
 // then added to the preceding byte.
 //
 // Lance stores the two subquantizers as contiguous 16-byte groups, so these
-// distances do not match `sum_4bit_dist_table_scalar`. This kernel only exists
-// to time that instruction mix.
+// distances do not match `sum_4bit_dist_table_scalar`.
 #[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn sum_dist_table_32bytes_batch_neon(
+#[inline(always)]
+unsafe fn sum_dist_table_32bytes_batch_neon_krl(
     codes: &[u8],
     dist_table: &[u8],
     dists: &mut [MaybeUninit<u16>],
