@@ -749,6 +749,13 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(
     _mm256_storeu_si256(dists.as_mut_ptr().add(16) as *mut __m256i, dis1);
 }
 
+// Performance trial of the KRL fast-scan sequence (`vsli`/`vsri`, 32-byte `tbl`,
+// `vpadal`). Odd code bytes are looked up in the second half of the table and
+// then added to the preceding byte.
+//
+// Lance stores the two subquantizers as contiguous 16-byte groups, so these
+// distances do not match `sum_4bit_dist_table_scalar`. This kernel only exists
+// to time that instruction mix.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn sum_dist_table_32bytes_batch_neon(
@@ -756,72 +763,72 @@ unsafe fn sum_dist_table_32bytes_batch_neon(
     dist_table: &[u8],
     dists: &mut [MaybeUninit<u16>],
 ) {
-    let low_mask = vdupq_n_u8(0x0f);
+    let mut acc0 = vdupq_n_u16(0);
+    let mut acc1 = vdupq_n_u16(0);
+    let mut acc2 = vdupq_n_u16(0);
+    let mut acc3 = vdupq_n_u16(0);
+    let dist_ptr = dists.as_mut_ptr().cast::<u16>();
 
-    // 8 accumulators: 4 per 128-bit "lane" (lo = bytes 0..16, hi = bytes 16..32 of each block)
-    let mut accu0_lo = vdupq_n_u16(0);
-    let mut accu1_lo = vdupq_n_u16(0);
-    let mut accu2_lo = vdupq_n_u16(0);
-    let mut accu3_lo = vdupq_n_u16(0);
-    let mut accu0_hi = vdupq_n_u16(0);
-    let mut accu1_hi = vdupq_n_u16(0);
-    let mut accu2_hi = vdupq_n_u16(0);
-    let mut accu3_hi = vdupq_n_u16(0);
-
-    let codes_ptr = codes.as_ptr();
-    let dt_ptr = dist_table.as_ptr();
-
-    for i in (0..codes.len()).step_by(32) {
-        // Process lo lane: bytes [i..i+16]
-        let c_lo = vld1q_u8(codes_ptr.add(i));
-        let lut_lo = vld1q_u8(dt_ptr.add(i));
-
-        let lo_lo = vandq_u8(c_lo, low_mask);
-        let hi_lo = vshrq_n_u8::<4>(c_lo);
-
-        let res_lo_lo = vqtbl1q_u8(lut_lo, lo_lo);
-        let res_hi_lo = vqtbl1q_u8(lut_lo, hi_lo);
-
-        accu0_lo = vaddq_u16(accu0_lo, vreinterpretq_u16_u8(res_lo_lo));
-        accu1_lo = vaddq_u16(accu1_lo, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_lo_lo)));
-        accu2_lo = vaddq_u16(accu2_lo, vreinterpretq_u16_u8(res_hi_lo));
-        accu3_lo = vaddq_u16(accu3_lo, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_hi_lo)));
-
-        // Process hi lane: bytes [i+16..i+32]
-        let c_hi = vld1q_u8(codes_ptr.add(i + 16));
-        let lut_hi = vld1q_u8(dt_ptr.add(i + 16));
-
-        let lo_hi = vandq_u8(c_hi, low_mask);
-        let hi_hi = vshrq_n_u8::<4>(c_hi);
-
-        let res_lo_hi = vqtbl1q_u8(lut_hi, lo_hi);
-        let res_hi_hi = vqtbl1q_u8(lut_hi, hi_hi);
-
-        accu0_hi = vaddq_u16(accu0_hi, vreinterpretq_u16_u8(res_lo_hi));
-        accu1_hi = vaddq_u16(accu1_hi, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_lo_hi)));
-        accu2_hi = vaddq_u16(accu2_hi, vreinterpretq_u16_u8(res_hi_hi));
-        accu3_hi = vaddq_u16(accu3_hi, vshrq_n_u16::<8>(vreinterpretq_u16_u8(res_hi_hi)));
+    // Each step below consumes 32 code bytes. `code_len == 0` still has to
+    // initialize the 32 outputs.
+    let blocks = codes.len() / 32;
+    if blocks == 0 {
+        vst1q_u16(dist_ptr, acc0);
+        vst1q_u16(dist_ptr.add(8), acc1);
+        vst1q_u16(dist_ptr.add(16), acc2);
+        vst1q_u16(dist_ptr.add(24), acc3);
+        return;
     }
 
-    // Merge: clean even bytes by subtracting the odd-byte bleed
-    accu0_lo = vsubq_u16(accu0_lo, vshlq_n_u16::<8>(accu1_lo));
-    accu0_hi = vsubq_u16(accu0_hi, vshlq_n_u16::<8>(accu1_hi));
+    // `0x1100` as bytes is `00 11 00 11 ...`. Shifted into the high nibble, odd
+    // bytes address the second 16-byte table of a `tbl` pair.
+    let bias = vreinterpretq_u8_u16(vdupq_n_u16(0x1100));
+    let mut codes_ptr = codes.as_ptr();
+    let mut lut_ptr = dist_table.as_ptr();
 
-    // Cross-lane merge: add lo and hi lane accumulators
-    // This is the NEON equivalent of AVX2's permute2f128 + blend + add
-    let dis0_even = vaddq_u16(accu0_lo, accu0_hi);
-    let dis0_odd = vaddq_u16(accu1_lo, accu1_hi);
-    vst1q_u16(dists.as_mut_ptr().cast::<u16>(), dis0_even);
-    vst1q_u16(dists.as_mut_ptr().add(8).cast::<u16>(), dis0_odd);
+    let mut mask0 = vld1q_u8(codes_ptr);
+    let mut mask1 = vld1q_u8(codes_ptr.add(16));
+    codes_ptr = codes_ptr.add(32);
+    let mut tables = vld1q_u8_x2(lut_ptr);
+    lut_ptr = lut_ptr.add(32);
 
-    // Same for hi-nibble accumulators (vectors 16..31)
-    accu2_lo = vsubq_u16(accu2_lo, vshlq_n_u16::<8>(accu3_lo));
-    accu2_hi = vsubq_u16(accu2_hi, vshlq_n_u16::<8>(accu3_hi));
+    for _ in 1..blocks {
+        let mask0_lo = vsliq_n_u8::<4>(mask0, bias);
+        let mask0_hi = vsriq_n_u8::<4>(bias, mask0);
+        mask0 = vld1q_u8(codes_ptr);
+        let mask1_lo = vsliq_n_u8::<4>(mask1, bias);
+        let mask1_hi = vsriq_n_u8::<4>(bias, mask1);
+        mask1 = vld1q_u8(codes_ptr.add(16));
+        codes_ptr = codes_ptr.add(32);
 
-    let dis1_even = vaddq_u16(accu2_lo, accu2_hi);
-    let dis1_odd = vaddq_u16(accu3_lo, accu3_hi);
-    vst1q_u16(dists.as_mut_ptr().add(16).cast::<u16>(), dis1_even);
-    vst1q_u16(dists.as_mut_ptr().add(24).cast::<u16>(), dis1_odd);
+        let looked0 = vqtbl2q_u8(tables, mask0_lo);
+        let looked1 = vqtbl2q_u8(tables, mask0_hi);
+        let looked2 = vqtbl2q_u8(tables, mask1_lo);
+        let looked3 = vqtbl2q_u8(tables, mask1_hi);
+
+        tables = vld1q_u8_x2(lut_ptr);
+        lut_ptr = lut_ptr.add(32);
+
+        acc0 = vpadalq_u8(acc0, looked0);
+        acc1 = vpadalq_u8(acc1, looked1);
+        acc2 = vpadalq_u8(acc2, looked2);
+        acc3 = vpadalq_u8(acc3, looked3);
+    }
+
+    let mask0_lo = vsliq_n_u8::<4>(mask0, bias);
+    let mask0_hi = vsriq_n_u8::<4>(bias, mask0);
+    let mask1_lo = vsliq_n_u8::<4>(mask1, bias);
+    let mask1_hi = vsriq_n_u8::<4>(bias, mask1);
+
+    acc0 = vpadalq_u8(acc0, vqtbl2q_u8(tables, mask0_lo));
+    acc1 = vpadalq_u8(acc1, vqtbl2q_u8(tables, mask0_hi));
+    acc2 = vpadalq_u8(acc2, vqtbl2q_u8(tables, mask1_lo));
+    acc3 = vpadalq_u8(acc3, vqtbl2q_u8(tables, mask1_hi));
+
+    vst1q_u16(dist_ptr, acc0);
+    vst1q_u16(dist_ptr.add(8), acc1);
+    vst1q_u16(dist_ptr.add(16), acc2);
+    vst1q_u16(dist_ptr.add(24), acc3);
 }
 
 /// Sum a quantized 4-bit PQ distance table over column-major codes.
