@@ -2500,6 +2500,7 @@ pub async fn test_scan_planning_io(
                 ],
                 version: crate::index::vector::IndexFileVersion::Legacy,
                 skip_transpose: false,
+                krl_code_layout: false,
                 runtime_hints: Default::default(),
                 pre_transform: None,
             },

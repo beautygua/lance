@@ -332,6 +332,10 @@ pub struct VectorIndexParams {
     /// Skip transpose / packing for PQ and RQ storage.
     pub skip_transpose: bool,
 
+    /// Write RQ codes in the KRL adjacent-byte layout, so the fast-scan reads
+    /// them straight from disk and loading needs no repack pass.
+    pub krl_code_layout: bool,
+
     /// Runtime hints: optional build preferences stored in the index manifest.
     /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
     /// Populated by the build path and merged into VectorIndexDetails at creation time.
@@ -352,6 +356,16 @@ impl VectorIndexParams {
         self
     }
 
+    /// Store RQ codes in the KRL adjacent-byte layout.
+    ///
+    /// The batch fast-scan then reads them directly and a loaded partition
+    /// keeps a single copy of its codes. Builds without the KRL kernel convert
+    /// back to the packed layout on load.
+    pub fn krl_code_layout(&mut self, enabled: bool) -> &mut Self {
+        self.krl_code_layout = enabled;
+        self
+    }
+
     pub fn ivf_flat(num_partitions: usize, metric_type: MetricType) -> Self {
         let ivf_params = IvfBuildParams::new(num_partitions);
         let stages = vec![StageParams::Ivf(ivf_params)];
@@ -360,6 +374,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -372,6 +387,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -408,6 +424,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -436,6 +453,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -453,6 +471,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -469,6 +488,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -485,6 +505,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -501,6 +522,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -524,6 +546,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -547,6 +570,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            krl_code_layout: false,
             runtime_hints: HashMap::new(),
             pre_transform: None,
         }
@@ -892,6 +916,12 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
+    if params.krl_code_layout {
+        return Err(Error::index(
+            "Build Distributed Vector Index: krl_code_layout is not supported for distributed              builds; shards are written row-major and packed once at merge time"
+                .to_string(),
+        ));
+    }
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -1533,6 +1563,7 @@ async fn build_vector_index_impl(
 
             let summary = builder
                 .with_transpose(!params.skip_transpose)
+                .with_krl_code_layout(params.krl_code_layout)
                 .with_optional_fragment_filter(fragment_ids)
                 .with_train_only(train_only)
                 .with_progress(progress.clone())
@@ -1845,6 +1876,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
+                .with_krl_code_layout(params.krl_code_layout)
                 .with_progress(progress.clone())
                 .build()
                 .await?;

@@ -325,6 +325,11 @@ pub struct RabitQuantizationMetadata {
     pub code_dim: u32,
     pub num_bits: u8,
     pub packed: bool,
+    /// Codes on disk are already in the KRL adjacent-byte layout, so loading
+    /// needs no `pack_codes` or repack pass. Only set when the index was built
+    /// with that layout enabled; older indices default to `false`.
+    #[serde(default)]
+    pub krl_layout: bool,
     #[serde(default = "default_query_estimator_compat")]
     pub query_estimator: RabitQueryEstimator,
 }
@@ -527,6 +532,10 @@ impl DeepSizeOf for RabitQuantizationMetadata {
 
 #[async_trait]
 impl QuantizerMetadata for RabitQuantizationMetadata {
+    fn codes_are_fastscan_layout(&self) -> bool {
+        self.krl_layout
+    }
+
     fn buffer_index(&self) -> Option<u32> {
         match self.rotation_type {
             RQRotationType::Matrix => self.rotate_mat_position,
@@ -603,6 +612,10 @@ pub struct RabitQuantizationStorage {
     // format).
     ex_codes: Option<FixedSizeListArray>,
     packed_ex_codes: Option<FixedSizeListArray>,
+    /// Packed codes in KRL adjacent-byte order. Present only with
+    /// `--features neon-dist-table-krl`. The fast-scan borrows this; single-row
+    /// reads stay on `codes`.
+    krl_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
 }
@@ -613,6 +626,11 @@ impl DeepSizeOf for RabitQuantizationStorage {
             + self.batch.deep_size_of_children(context)
             + self
                 .packed_ex_codes
+                .as_ref()
+                .map(|codes| (codes as &dyn Array).deep_size_of_children(context))
+                .unwrap_or_default()
+            + self
+                .krl_codes
                 .as_ref()
                 .map(|codes| (codes as &dyn Array).deep_size_of_children(context))
                 .unwrap_or_default()
@@ -772,6 +790,17 @@ impl RabitQuantizationStorage {
             query_factors.error,
             approx_mode,
         );
+        if let Some(krl_codes) = &self.krl_codes {
+            calculator.fastscan_codes = krl_codes.values().as_primitive::<UInt8Type>().values();
+            calculator.fastscan_codes_are_krl = true;
+        }
+        // A partition built with the KRL layout keeps only those bytes: the
+        // batch kernel reads them directly and the single-row walk converts
+        // per block.
+        calculator.codes_are_krl = self.metadata.krl_layout;
+        // A KRL-layout partition scans its own bytes, so they are the
+        // fast-scan layout too.
+        calculator.fastscan_codes_are_krl |= self.metadata.krl_layout;
         calculator.add_factor_scale = query_factors.add_scale;
         calculator.add_factor_offset = query_factors.add_offset;
         if self.ex_codes.is_none() && self.metadata.num_bits > 1 {
@@ -1011,6 +1040,16 @@ pub struct RabitDistCalculator<'a> {
     ex_add_factors: Option<&'a [f32]>,
     ex_scale_factors: Option<&'a [f32]>,
     packed_ex_codes: Option<&'a [u8]>,
+    /// Codes the 4-bit fast-scan reads. Same bytes as `codes` unless the KRL
+    /// layout was built at partition load.
+    fastscan_codes: &'a [u8],
+    /// `codes` holds the KRL adjacent-byte layout, so the single-row walk has
+    /// to convert each 32-byte block back to the packed form before indexing.
+    codes_are_krl: bool,
+    /// `fastscan_codes` holds the KRL layout, whichever of the two sources it
+    /// came from. The batch kernel must match this, not `codes_are_krl`: a
+    /// packed partition scans its KRL copy.
+    fastscan_codes_are_krl: bool,
     query_factor: f32,
     query_error: f32,
     add_factor_scale: f32,
@@ -1065,6 +1104,9 @@ impl<'a> RabitDistCalculator<'a> {
             ex_add_factors,
             ex_scale_factors,
             packed_ex_codes,
+            fastscan_codes: codes,
+            codes_are_krl: false,
+            fastscan_codes_are_krl: false,
             query_factor,
             query_error,
             approx_mode,
@@ -1112,6 +1154,7 @@ impl<'a> RabitDistCalculator<'a> {
                     n,
                     code_len,
                     &self.dist_table,
+                    self.codes_are_krl,
                 ));
             });
         // Every reserved slot was initialized above.
@@ -1174,7 +1217,7 @@ impl<'a> RabitDistCalculator<'a> {
             simd::dist_table::sum_4bit_dist_table_u32_uninit(
                 simd_len,
                 code_len,
-                self.codes,
+                self.fastscan_codes,
                 dist_table,
                 &mut hacc_quantized_dists.spare_capacity_mut()[..simd_len],
             );
@@ -1183,12 +1226,13 @@ impl<'a> RabitDistCalculator<'a> {
         } else {
             quantized_dists.clear();
             quantized_dists.reserve(simd_len);
-            simd::dist_table::sum_4bit_dist_table_uninit(
+            simd::dist_table::sum_4bit_dist_table_uninit_for_layout(
                 simd_len,
                 code_len,
-                self.codes,
+                self.fastscan_codes,
                 dist_table,
                 &mut quantized_dists.spare_capacity_mut()[..simd_len],
+                self.fastscan_codes_are_krl,
             );
             // SAFETY: the kernel initialized every SIMD output slot.
             unsafe { quantized_dists.set_len(simd_len) };
@@ -1225,12 +1269,13 @@ impl<'a> RabitDistCalculator<'a> {
                     n,
                     code_len,
                     &self.dist_table,
+                    self.codes_are_krl,
                 ));
             });
         // Both the SIMD reconstruction and scalar remainder initialized their slots.
         unsafe { dists.set_len(n) };
         self.adjust_remapped_binary_tail(n, code_len, dists, |id| {
-            let sum: u32 = get_rq_code(self.codes, id, n, code_len)
+            let sum: u32 = get_rq_code(self.codes, id, n, code_len, self.codes_are_krl)
                 .enumerate()
                 .map(|(byte, code)| {
                     u32::from(dist_table[byte * 32 + usize::from(code & 15)])
@@ -1280,10 +1325,23 @@ impl<'a> RabitDistCalculator<'a> {
         let simd_len = n - remainder;
         quantized_dists.clear();
         quantized_dists.reserve(simd_len);
+        // The high-accuracy kernel indexes the packed layout and has no KRL
+        // variant. A KRL-layout partition holds only those bytes, so convert
+        // the blocks this query reads into a scratch buffer.
+        let mut packed_scratch: Vec<u8> = Vec::new();
+        let hacc_codes = if self.codes_are_krl {
+            packed_scratch.reserve(simd_len * code_len);
+            for block in self.codes[..simd_len * code_len].chunks_exact(BATCH_SIZE) {
+                packed_scratch.extend_from_slice(&packed_block_from_krl(block));
+            }
+            packed_scratch.as_slice()
+        } else {
+            self.codes
+        };
         simd::dist_table::sum_4bit_hacc_dist_table_uninit(
             simd_len,
             code_len,
-            self.codes,
+            hacc_codes,
             hacc_dist_table,
             &mut quantized_dists.spare_capacity_mut()[..simd_len],
         );
@@ -1312,12 +1370,13 @@ impl<'a> RabitDistCalculator<'a> {
                     n,
                     code_len,
                     &self.dist_table,
+                    self.codes_are_krl,
                 ));
             });
         // Both the SIMD reconstruction and scalar remainder initialized their slots.
         unsafe { dists.set_len(n) };
         self.adjust_remapped_binary_tail(n, code_len, dists, |id| {
-            let sum: u32 = get_rq_code(self.codes, id, n, code_len)
+            let sum: u32 = get_rq_code(self.codes, id, n, code_len, self.codes_are_krl)
                 .enumerate()
                 .map(|(byte, code)| {
                     let low = byte * 64 + usize::from(code & 15);
@@ -1367,7 +1426,14 @@ impl<'a> RabitDistCalculator<'a> {
                 dists[offset] = if live_position < live_simd {
                     quantized(offset)
                 } else {
-                    compute_single_rq_distance(self.codes, offset, n, code_len, &self.dist_table)
+                    compute_single_rq_distance(
+                        self.codes,
+                        offset,
+                        n,
+                        code_len,
+                        &self.dist_table,
+                        self.codes_are_krl,
+                    )
                 };
             }
             live_position += 1;
@@ -1443,12 +1509,15 @@ impl<'a> RabitDistCalculator<'a> {
                     );
                     quantized_dists.clear();
                     quantized_dists.reserve(fastscan_len);
-                    simd::dist_table::sum_4bit_dist_table_uninit(
+                    simd::dist_table::sum_4bit_dist_table_uninit_for_layout(
                         fastscan_len,
                         fastscan_code_len,
                         packed_ex_codes,
                         quantized_dists_table,
                         &mut quantized_dists.spare_capacity_mut()[..fastscan_len],
+                        // `maybe_pack_ex_codes` applies the same layout the
+                        // build's KRL feature selects.
+                        cfg!(feature = "neon-dist-table-krl"),
                     );
                     // SAFETY: the distance-table kernel initialized every
                     // fast-scan slot.
@@ -1970,7 +2039,17 @@ fn maybe_pack_ex_codes(
         return None;
     }
     match ex_bits {
-        2 | 4 | 8 => Some(pack_codes(ex_codes)),
+        2 | 4 | 8 => {
+            let packed = pack_codes(ex_codes);
+            #[cfg(feature = "neon-dist-table-krl")]
+            {
+                Some(krl_list_from_lance(&packed))
+            }
+            #[cfg(not(feature = "neon-dist-table-krl"))]
+            {
+                Some(packed)
+            }
+        }
         _ => None,
     }
 }
@@ -2064,7 +2143,14 @@ impl DistCalculator for RabitDistCalculator<'_> {
         let code_len = rabit_binary_code_bytes(self.dim);
         let num_vectors = self.codes.len() / code_len;
         let dist =
-            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
+            compute_single_rq_distance(
+                self.codes,
+                id,
+                num_vectors,
+                code_len,
+                &self.dist_table,
+                self.codes_are_krl,
+            );
 
         match self.query_estimator {
             RabitQueryEstimator::ResidualQuery => {
@@ -2537,6 +2623,126 @@ fn get_column(
     }
 }
 
+/// Codes the KRL NEON fast-scan reads, built once when a partition is loaded.
+///
+/// Absent unless `neon-dist-table-krl` is enabled. Disk bytes stay in
+/// [`pack_codes`] order.
+pub(crate) fn krl_codes_from_lance(codes: &FixedSizeListArray) -> Option<FixedSizeListArray> {
+    #[cfg(feature = "neon-dist-table-krl")]
+    {
+        Some(krl_list_from_lance(codes))
+    }
+    #[cfg(not(feature = "neon-dist-table-krl"))]
+    {
+        let _ = codes;
+        None
+    }
+}
+
+#[cfg(feature = "neon-dist-table-krl")]
+fn krl_list_from_lance(codes: &FixedSizeListArray) -> FixedSizeListArray {
+    let code_len = codes.value_length() as usize;
+    let values = codes.values().as_primitive::<UInt8Type>().values();
+    FixedSizeListArray::try_new_from_values(
+        UInt8Array::from(repack_lance_packed_to_krl(values, code_len)),
+        code_len as i32,
+    )
+    .expect("KRL repack keeps one byte per vector")
+}
+
+/// Rewrite Lance packed blocks into the KRL adjacent-byte layout.
+///
+/// Each 32-byte block is one subquantizer pair for 32 vectors. Lance stores
+/// subquantizer `2k` in bytes 0..16 and `2k+1` in bytes 16..32, with `PERM0`
+/// pairing vector `v` and `v+16`. KRL stores those two subquantizers in
+/// adjacent bytes: even byte is `2k` for vectors `k` and `k+8`, the next byte
+/// is `2k+1` for the same vectors. A full block of 32 vectors is split into
+/// vectors 0..15 then 16..31. Bytes after the last full block are copied
+/// through; that tail is the transposed remainder and is not scanned by the
+/// 32-wide kernel.
+pub fn repack_lance_packed_to_krl(codes: &[u8], code_len: usize) -> Vec<u8> {
+    if code_len == 0 {
+        return codes.to_vec();
+    }
+    let batch_bytes = BATCH_SIZE * code_len;
+    let full = codes.len() / batch_bytes * batch_bytes;
+    let mut out = codes.to_vec();
+    for batch in out[..full].chunks_exact_mut(batch_bytes) {
+        for block in batch.chunks_exact_mut(BATCH_SIZE) {
+            let converted = krl_block_from_lance(block);
+            block.copy_from_slice(&converted);
+        }
+    }
+    out
+}
+
+/// Rewrite KRL adjacent-byte blocks back into Lance packed blocks.
+///
+/// Inverse of [`repack_lance_packed_to_krl`], used when a KRL-layout partition
+/// is loaded by a build without the KRL kernel.
+pub fn repack_krl_to_lance_packed(codes: &[u8], code_len: usize) -> Vec<u8> {
+    if code_len == 0 {
+        return codes.to_vec();
+    }
+    let batch_bytes = BATCH_SIZE * code_len;
+    let full = codes.len() / batch_bytes * batch_bytes;
+    let mut out = codes.to_vec();
+    for batch in out[..full].chunks_exact_mut(batch_bytes) {
+        for block in batch.chunks_exact_mut(BATCH_SIZE) {
+            let converted = packed_block_from_krl(block);
+            block.copy_from_slice(&converted);
+        }
+    }
+    out
+}
+
+fn krl_block_from_lance(block: &[u8]) -> [u8; BATCH_SIZE] {
+    let mut sq0 = [0u8; BATCH_SIZE];
+    let mut sq1 = [0u8; BATCH_SIZE];
+    for lane in 0..16 {
+        sq0[PERM0[lane]] = block[lane] & 0x0f;
+        sq0[PERM0[lane] + 16] = block[lane] >> 4;
+        sq1[PERM0[lane]] = block[lane + 16] & 0x0f;
+        sq1[PERM0[lane] + 16] = block[lane + 16] >> 4;
+    }
+    let mut dst = [0u8; BATCH_SIZE];
+    for group in (0..BATCH_SIZE).step_by(16) {
+        for pair in 0..8 {
+            dst[group + 2 * pair] = sq0[group + pair] | (sq0[group + pair + 8] << 4);
+            dst[group + 2 * pair + 1] = sq1[group + pair] | (sq1[group + pair + 8] << 4);
+        }
+    }
+    dst
+}
+
+/// Inverse of [`krl_block_from_lance`]: rewrite one KRL 32-byte block back into
+/// the Lance packed layout.
+///
+/// Partitions stored in the KRL layout are read by the batch fast-scan as-is.
+/// The single-row path still walks the packed layout, so it converts just the
+/// block it needs. Both directions are pure per-block permutations, which the
+/// round-trip test pins down.
+fn packed_block_from_krl(block: &[u8]) -> [u8; BATCH_SIZE] {
+    let mut sq0 = [0u8; BATCH_SIZE];
+    let mut sq1 = [0u8; BATCH_SIZE];
+    for group in (0..BATCH_SIZE).step_by(16) {
+        for pair in 0..8 {
+            let even = block[group + 2 * pair];
+            let odd = block[group + 2 * pair + 1];
+            sq0[group + pair] = even & 0x0f;
+            sq0[group + pair + 8] = even >> 4;
+            sq1[group + pair] = odd & 0x0f;
+            sq1[group + pair + 8] = odd >> 4;
+        }
+    }
+    let mut out = [0u8; BATCH_SIZE];
+    for lane in 0..16 {
+        out[lane] = sq0[PERM0[lane]] | (sq0[PERM0[lane] + 16] << 4);
+        out[lane + 16] = sq1[PERM0[lane]] | (sq1[PERM0[lane] + 16] << 4);
+    }
+    out
+}
+
 pub fn pack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
     let code_len = codes.value_length() as usize;
 
@@ -2720,6 +2926,27 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
+        Self::try_from_batch_with_fastscan_codes(batch, metadata, distance_type, fri, None)
+    }
+
+    fn try_from_batch_with_quantizer_and_fastscan_codes(
+        batch: RecordBatch,
+        _quantizer: &crate::vector::quantizer::Quantizer,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+        fastscan_codes: Option<FixedSizeListArray>,
+    ) -> Result<Self> {
+        Self::try_from_batch_with_fastscan_codes(batch, metadata, distance_type, fri, fastscan_codes)
+    }
+
+    fn try_from_batch_with_fastscan_codes(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+        fastscan_codes: Option<FixedSizeListArray>,
+    ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
             _ => distance_type,
@@ -2831,7 +3058,27 @@ impl QuantizerStorage for RabitQuantizationStorage {
             )));
         }
 
-        let (batch, codes) = if !metadata.packed {
+        // A KRL-layout partition is stored in the form the fast-scan wants, so
+        // it needs neither `pack_codes` nor a repack. Keep the disk bytes as
+        // the only copy and let the single-row path convert per block.
+        //
+        // Only the KRL kernel can scan that layout. A build without it converts
+        // back to the packed layout on load, so the distances stay correct.
+        let krl_on_disk = metadata.krl_layout && cfg!(feature = "neon-dist-table-krl");
+        let (batch, codes) = if krl_on_disk {
+            (batch, codes)
+        } else if metadata.krl_layout {
+            let code_len = codes.value_length() as usize;
+            let values = codes.values().as_primitive::<UInt8Type>().values();
+            let packed = repack_krl_to_lance_packed(values, code_len);
+            let codes = FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(packed),
+                code_len as i32,
+            )?;
+            let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
+            let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+            (batch, codes)
+        } else if !metadata.packed {
             let codes = pack_codes(&codes);
             let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
             let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
@@ -2842,8 +3089,16 @@ impl QuantizerStorage for RabitQuantizationStorage {
 
         let mut metadata = metadata.clone();
         metadata.packed = true;
+        metadata.krl_layout = krl_on_disk;
         let packed_ex_codes =
             maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref());
+        // A caller that already holds the fast-scan layout (the code-only
+        // partition cache) hands it in, so a query never rewrites the codes.
+        let krl_codes = if krl_on_disk {
+            None
+        } else {
+            fastscan_codes.or_else(|| krl_codes_from_lance(&codes))
+        };
 
         let storage = Self {
             metadata,
@@ -2856,6 +3111,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             error_factors,
             ex_codes,
             packed_ex_codes,
+            krl_codes,
             ex_add_factors,
             ex_scale_factors,
         };
@@ -2896,13 +3152,25 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 Some(Some(new_id)) => {
                     indices.push(i as u32);
                     new_row_ids.push(new_id);
-                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
+                    new_codes.extend(get_rq_code(
+                        codes,
+                        i,
+                        num_vectors,
+                        num_code_bytes,
+                        self.metadata.krl_layout,
+                    ));
                 }
                 Some(None) => {}
                 None => {
                     indices.push(i as u32);
                     new_row_ids.push(*row_id);
-                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
+                    new_codes.extend(get_rq_code(
+                        codes,
+                        i,
+                        num_vectors,
+                        num_code_bytes,
+                        self.metadata.krl_layout,
+                    ));
                 }
             }
         }
@@ -2915,7 +3183,19 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let batch = if new_row_ids.is_empty() {
             RecordBatch::new_empty(self.schema().clone())
         } else {
-            let codes = Arc::new(pack_codes(&new_codes));
+            // `new_codes` is row-major. Pack it, then put it back into whichever
+            // layout this partition stores.
+            let packed = pack_codes(&new_codes);
+            let codes = if self.metadata.krl_layout {
+                let packed_values = packed.values().as_primitive::<UInt8Type>().values();
+                let krl = repack_lance_packed_to_krl(packed_values, num_code_bytes);
+                Arc::new(FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(krl),
+                    num_code_bytes as i32,
+                )?)
+            } else {
+                Arc::new(packed)
+            };
             self.batch
                 .take(&UInt32Array::from(indices))?
                 .replace_column_by_name(ROW_ID, Arc::new(new_row_ids.clone()))?
@@ -2943,6 +3223,11 @@ impl QuantizerStorage for RabitQuantizationStorage {
         };
         let packed_ex_codes =
             maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref());
+        let krl_codes = if self.metadata.krl_layout {
+            None
+        } else {
+            krl_codes_from_lance(&codes)
+        };
         let ex_add_factors = batch
             .column_by_name(EX_ADD_FACTORS_COLUMN)
             .map(|factors| factors.as_primitive::<Float32Type>().clone());
@@ -2960,6 +3245,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             error_factors,
             ex_codes,
             packed_ex_codes,
+            krl_codes,
             ex_add_factors,
             ex_scale_factors,
             row_ids: new_row_ids,
@@ -2979,6 +3265,7 @@ fn compute_single_rq_distance(
     num_vectors: usize,
     num_code_bytes: usize,
     dist_table: &[f32],
+    codes_are_krl: bool,
 ) -> f32 {
     let remainder = num_vectors % BATCH_SIZE;
     let mut dist_table_iter = dist_table
@@ -2997,6 +3284,16 @@ fn compute_single_rq_distance(
 
         let mut dist = 0.0f32;
         for block in batch_codes.as_chunks::<BATCH_SIZE>().0 {
+            // A KRL-layout partition stores this block in the adjacent-byte
+            // form the batch kernel wants; the row walk below still indexes the
+            // packed form, so convert the one block it is about to read.
+            let converted;
+            let block = if codes_are_krl {
+                converted = packed_block_from_krl(block);
+                &converted[..]
+            } else {
+                block
+            };
             let code_byte = if is_lower {
                 (block[idx] & 0xF) | (block[idx + 16] << 4)
             } else {
@@ -3031,6 +3328,7 @@ fn get_rq_code(
     id: usize,
     num_vectors: usize,
     num_code_bytes: usize,
+    codes_are_krl: bool,
 ) -> impl Iterator<Item = u8> + '_ {
     let remainder = num_vectors % BATCH_SIZE;
 
@@ -3040,27 +3338,33 @@ fn get_rq_code(
             ..(id / BATCH_SIZE + 1) * BATCH_SIZE * num_code_bytes];
 
         let id_in_batch = id % BATCH_SIZE;
-        if id_in_batch < 16 {
-            let idx = PERM0_INVERSE[id_in_batch];
-            codes
-                .as_chunks::<BATCH_SIZE>()
-                .0
-                .iter()
-                .map(|block| (block[idx] & 0xF) | (block[idx + 16] << 4))
-                .exact_size(num_code_bytes)
-                .collect_vec()
-                .into_iter()
+        let is_lower = id_in_batch < 16;
+        let idx = if is_lower {
+            PERM0_INVERSE[id_in_batch]
         } else {
-            let idx = PERM0_INVERSE[id_in_batch - 16];
-            codes
-                .as_chunks::<BATCH_SIZE>()
-                .0
-                .iter()
-                .map(|block| (block[idx] >> 4) | (block[idx + 16] & 0xF0))
-                .exact_size(num_code_bytes)
-                .collect_vec()
-                .into_iter()
-        }
+            PERM0_INVERSE[id_in_batch - 16]
+        };
+        codes
+            .as_chunks::<BATCH_SIZE>()
+            .0
+            .iter()
+            .map(move |block| {
+                let converted;
+                let block = if codes_are_krl {
+                    converted = packed_block_from_krl(block);
+                    &converted[..]
+                } else {
+                    block
+                };
+                if is_lower {
+                    (block[idx] & 0xF) | (block[idx + 16] << 4)
+                } else {
+                    (block[idx] >> 4) | (block[idx + 16] & 0xF0)
+                }
+            })
+            .exact_size(num_code_bytes)
+            .collect_vec()
+            .into_iter()
     } else {
         let id = id - (num_vectors - remainder);
         let codes = &codes[(num_vectors - remainder) * num_code_bytes..];
@@ -3242,6 +3546,161 @@ mod tests {
         assert_eq!(calc.distance_all(0), expected);
     }
 
+    /// A partition stored in the KRL layout must produce the same distances as
+    /// the same partition stored packed: the batch path reads KRL directly and
+    /// the single-row path converts per block, so both must agree with the
+    /// packed reference on every row.
+    #[test]
+    fn test_krl_layout_matches_packed_layout() {
+        for (dim, num_rows) in [(64usize, 35usize), (64, 64), (64, 100), (4096, 40)] {
+            let code_len = dim / 8;
+            let mut metadata = make_test_metadata(dim);
+            metadata.num_bits = 1;
+
+            // Row-major codes, then packed, so the packed form is the reference.
+            let rows = (0..num_rows * code_len)
+                .map(|i| (i * 37 + 11) as u8)
+                .collect::<Vec<_>>();
+            let row_major =
+                FixedSizeListArray::try_new_from_values(UInt8Array::from(rows), code_len as i32)
+                    .unwrap();
+            let packed = pack_codes(&row_major);
+            let packed_values = packed.values().as_primitive::<UInt8Type>().values();
+            let krl_values = repack_lance_packed_to_krl(packed_values, code_len);
+
+            let make_batch = |values: Vec<u8>| {
+                RecordBatch::try_from_iter(vec![
+                    (
+                        ROW_ID,
+                        Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+                    ),
+                    (
+                        RABIT_CODE_COLUMN,
+                        Arc::new(
+                            FixedSizeListArray::try_new_from_values(
+                                UInt8Array::from(values),
+                                code_len as i32,
+                            )
+                            .unwrap(),
+                        ) as ArrayRef,
+                    ),
+                    (
+                        ADD_FACTORS_COLUMN,
+                        Arc::new(Float32Array::from_iter_values(
+                            (0..num_rows).map(|v| v as f32 + 0.5),
+                        )) as ArrayRef,
+                    ),
+                    (
+                        SCALE_FACTORS_COLUMN,
+                        Arc::new(Float32Array::from_iter_values(
+                            (0..num_rows).map(|v| v as f32 + 1.5),
+                        )) as ArrayRef,
+                    ),
+                ])
+                .unwrap()
+            };
+
+            // Reference: packed bytes with `packed = true`.
+            let mut packed_meta = metadata.clone();
+            packed_meta.packed = true;
+            let packed_storage = RabitQuantizationStorage::try_from_batch(
+                make_batch(packed_values.to_vec()),
+                &packed_meta,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap();
+
+            // KRL bytes, marked as the KRL layout.
+            let mut krl_meta = metadata.clone();
+            krl_meta.packed = true;
+            krl_meta.krl_layout = true;
+            let krl_storage = RabitQuantizationStorage::try_from_batch(
+                make_batch(krl_values),
+                &krl_meta,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap();
+
+            // Only one copy of the codes may be resident for a KRL partition.
+            assert!(
+                krl_storage.krl_codes.is_none(),
+                "KRL partition must not keep a second copy"
+            );
+
+            let query = Arc::new(Float32Array::from_iter_values(
+                (0..dim).map(|i| (i % 7) as f32 * 0.25 - 0.5),
+            )) as ArrayRef;
+
+            for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
+                let opts = DistanceCalculatorOptions { approx_mode };
+                let mut packed_scratch = Vec::new();
+                let packed_calc = packed_storage.dist_calculator_with_scratch(
+                    query.clone(),
+                    0.0,
+                    None,
+                    &mut packed_scratch,
+                    opts,
+                );
+                let mut krl_scratch = Vec::new();
+                let krl_calc = krl_storage.dist_calculator_with_scratch(
+                    query.clone(),
+                    0.0,
+                    None,
+                    &mut krl_scratch,
+                    opts,
+                );
+
+                let packed_all = packed_calc.distance_all(0);
+                let krl_all = krl_calc.distance_all(0);
+                assert_eq!(
+                    packed_all.len(),
+                    krl_all.len(),
+                    "dim={dim} rows={num_rows} mode={approx_mode:?}"
+                );
+                for row in 0..num_rows {
+                    assert_eq!(
+                        packed_all[row], krl_all[row],
+                        "batch dim={dim} rows={num_rows} mode={approx_mode:?} row={row}"
+                    );
+                    assert_eq!(
+                        packed_calc.distance(row as u32),
+                        krl_calc.distance(row as u32),
+                        "single dim={dim} rows={num_rows} mode={approx_mode:?} row={row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_krl_block_round_trip() {
+        // `packed_block_from_krl` must invert `krl_block_from_lance` exactly for
+        // every possible block, otherwise the single-row path would read the
+        // wrong codes from a KRL-layout partition.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x6b72_6c21);
+        for _ in 0..512 {
+            let mut block = [0u8; BATCH_SIZE];
+            for byte in block.iter_mut() {
+                *byte = rng.random::<u8>();
+            }
+            let krl = krl_block_from_lance(&block);
+            // The map permutes nibbles, so the byte multiset changes; only the
+            // round trip is meaningful.
+            assert_eq!(
+                packed_block_from_krl(&krl),
+                block,
+                "round trip changed the block"
+            );
+            assert_eq!(
+                krl_block_from_lance(&packed_block_from_krl(&krl)),
+                krl,
+                "reverse round trip changed the block"
+            );
+        }
+    }
+
     #[test]
     fn test_pack_unpack_codes() {
         // Test with multiple batch sizes to cover both packed and transposed sections
@@ -3278,6 +3737,79 @@ mod tests {
                 "Mismatch for num_vectors={}",
                 num_vectors
             );
+        }
+    }
+
+    /// One subquantizer pair, in the order `vpadal` + the direct stores produce:
+    /// lanes 0..7, 8..15, 16..23, 24..31.
+    fn krl_neon_lane(block: &[u8], table: &[u8], vector: usize) -> u16 {
+        let (group_base, within) = if vector < 16 {
+            (0, vector)
+        } else {
+            (16, vector - 16)
+        };
+        let (pair, high) = if within < 8 {
+            (within, false)
+        } else {
+            (within - 8, true)
+        };
+        let sq0_byte = block[group_base + 2 * pair];
+        let sq1_byte = block[group_base + 2 * pair + 1];
+        let sq0 = if high { sq0_byte >> 4 } else { sq0_byte & 0x0f };
+        let sq1 = if high { sq1_byte >> 4 } else { sq1_byte & 0x0f };
+        u16::from(table[usize::from(sq0)]) + u16::from(table[16 + usize::from(sq1)])
+    }
+
+    #[test]
+    fn test_repack_lance_packed_to_krl_matches_fastscan_order() {
+        let code_len = 2;
+        let num_vectors = 40;
+        let mut rows = Vec::with_capacity(num_vectors * code_len);
+        for vector in 0..num_vectors {
+            for byte in 0..code_len {
+                rows.push((vector * 17 + byte * 3) as u8);
+            }
+        }
+        let original = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(rows.clone()),
+            code_len as i32,
+        )
+        .unwrap();
+        let packed = pack_codes(&original);
+        let packed_values = packed.values().as_primitive::<UInt8Type>().values();
+        let krl = repack_lance_packed_to_krl(packed_values, code_len);
+
+        let tail = (num_vectors % BATCH_SIZE) * code_len;
+        let full = packed_values.len() - tail;
+        assert_eq!(&krl[full..], &packed_values[full..]);
+
+        let mut tables = Vec::new();
+        for table in 0..(code_len * 2) {
+            let mut entries = [0u8; 16];
+            for (entry, slot) in entries.iter_mut().enumerate() {
+                *slot = (table * 13 + entry * 5) as u8;
+            }
+            tables.push(entries);
+        }
+
+        for vector in 0..BATCH_SIZE {
+            let mut expected = 0u16;
+            for byte in 0..code_len {
+                let code = rows[vector * code_len + byte];
+                expected += u16::from(tables[byte * 2][usize::from(code & 0x0f)]);
+                expected += u16::from(tables[byte * 2 + 1][usize::from(code >> 4)]);
+            }
+            let mut got = 0u16;
+            for byte in 0..code_len {
+                let block = &krl[byte * BATCH_SIZE..(byte + 1) * BATCH_SIZE];
+                let flat: Vec<u8> = tables[byte * 2]
+                    .iter()
+                    .chain(tables[byte * 2 + 1].iter())
+                    .copied()
+                    .collect();
+                got += krl_neon_lane(block, &flat, vector);
+            }
+            assert_eq!(got, expected, "vector {vector}");
         }
     }
 
@@ -3645,6 +4177,7 @@ mod tests {
             code_dim: code_dim as u32,
             num_bits: 2,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
@@ -3771,6 +4304,7 @@ mod tests {
                         code_dim: code_dim as u32,
                         num_bits,
                         packed: false,
+                        krl_layout: false,
                         query_estimator: RabitQueryEstimator::RawQuery,
                     };
                     let codes = FixedSizeListArray::try_new_from_values(
@@ -3935,6 +4469,7 @@ mod tests {
             code_dim: code_dim as u32,
             num_bits: 2,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
@@ -4106,6 +4641,7 @@ mod tests {
             code_dim: code_dim as u32,
             num_bits,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let code_len = rabit_binary_code_bytes(code_dim);
@@ -4310,6 +4846,7 @@ mod tests {
             code_dim: code_dim as u32,
             num_bits,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes = FixedSizeListArray::try_new_from_values(
@@ -4347,6 +4884,7 @@ mod tests {
                     num_rows,
                     code_len,
                     &calc.dist_table,
+                    calc.codes_are_krl,
                 );
                 calc.raw_query_multi_bit_exact_distance(
                     id,
@@ -4394,6 +4932,7 @@ mod tests {
             code_dim: code_dim as u32,
             num_bits,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes = FixedSizeListArray::try_new_from_values(
@@ -4712,6 +5251,7 @@ mod tests {
             code_dim: code_dim as u32,
             num_bits: 1,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
@@ -4746,6 +5286,7 @@ mod tests {
             code_dim: code_dim as u32,
             num_bits: 2,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
@@ -5453,7 +5994,14 @@ mod tests {
 
         for (id, binary_ip) in binary_ips.iter().enumerate() {
             let exact =
-                compute_single_rq_distance(calc.codes, id, num_rows, code_len, &calc.dist_table);
+                compute_single_rq_distance(
+                    calc.codes,
+                    id,
+                    num_rows,
+                    code_len,
+                    &calc.dist_table,
+                    calc.codes_are_krl,
+                );
             let error = (binary_ip - exact).abs();
             assert!(
                 error <= quantization_bound + 1e-4 * exact.abs(),

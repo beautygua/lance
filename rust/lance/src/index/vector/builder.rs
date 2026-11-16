@@ -17,7 +17,7 @@ use arrow::datatypes::{Float16Type, Float64Type, UInt8Type, UInt64Type};
 use arrow_array::types::Float32Type;
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, PrimitiveArray,
-    RecordBatch, UInt32Array, UInt64Array,
+    RecordBatch, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, SinkExt, stream, stream::BoxStream};
@@ -39,7 +39,9 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
-use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::bq::storage::{
+    RABIT_CODE_COLUMN, pack_codes, repack_lance_packed_to_krl, unpack_codes,
+};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
@@ -390,6 +392,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     target_partition_size: Option<usize>,
     // whether to transpose codes when building storage
     transpose_codes: bool,
+    // whether to write RQ codes in the KRL adjacent-byte layout, so loading
+    // needs no repack pass
+    krl_code_layout: bool,
 
     // lance file version for writing index files
     format_version: ConcreteFileVersion,
@@ -510,6 +515,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             merged_num: 0,
             target_partition_size: None,
             transpose_codes: true,
+            krl_code_layout: false,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
             pca_params: None,
@@ -580,6 +586,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             merged_num: 0,
             target_partition_size: None,
             transpose_codes: true,
+            krl_code_layout: false,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
             pca_params: None,
@@ -796,6 +803,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// This mainly affects intermediate PQ/RQ storage when building distributed indices.
     pub fn with_transpose(&mut self, transpose: bool) -> &mut Self {
         self.transpose_codes = transpose;
+        self
+    }
+
+    /// Write RQ codes in the KRL adjacent-byte layout.
+    ///
+    /// The batch fast-scan reads that layout directly, so a partition built
+    /// this way needs no `pack_codes` or repack when it is loaded. The
+    /// single-row path converts each 32-byte block on demand.
+    pub fn with_krl_code_layout(&mut self, enabled: bool) -> &mut Self {
+        self.krl_code_layout = enabled;
         self
     }
 
@@ -1975,6 +1992,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
                         }
 
+                        if is_rq
+                            && self.krl_code_layout
+                            && batch.num_rows() > 0
+                            && batch.column_by_name(RABIT_CODE_COLUMN).is_some()
+                        {
+                            // Write the fast-scan layout once, at build time.
+                            let codes_fsl = batch
+                                .column_by_name(RABIT_CODE_COLUMN)
+                                .unwrap()
+                                .as_fixed_size_list();
+                            let code_len = codes_fsl.value_length() as usize;
+                            // With transpose on, the quantizer already emitted
+                            // the packed layout; otherwise the batch was just
+                            // unpacked above and needs packing back.
+                            let packed = if self.transpose_codes {
+                                codes_fsl.clone()
+                            } else {
+                                pack_codes(codes_fsl)
+                            };
+                            let packed_values =
+                                packed.values().as_primitive::<datatypes::UInt8Type>();
+                            let krl =
+                                repack_lance_packed_to_krl(packed_values.values(), code_len);
+                            let krl_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                                UInt8Array::from(krl),
+                                code_len as i32,
+                            )?);
+                            batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, krl_fsl)?;
+                        }
+
                         if storage_writer.is_none() {
                             let storage_schema: Schema = batch.schema_ref().as_ref().try_into()?;
                             storage_writer = Some(file_versions::create_writer(
@@ -2073,12 +2120,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             QuantizationType::Product | QuantizationType::Rabit => self.transpose_codes,
             _ => false,
         };
+        let krl_layout = quantization_type == QuantizationType::Rabit && self.krl_code_layout;
         // For now, each partition's metadata is just the quantizer,
         // it's all the same for now, so we just take the first one
         let mut metadata = quantizer.metadata(Some(QuantizationMetadata {
             codebook_position: Some(0),
             codebook: None,
             transposed,
+            krl_layout,
         }));
         if let Some(extra_metadata) = metadata.extra_metadata()? {
             let idx = storage_writer.add_global_buffer(extra_metadata).await?;

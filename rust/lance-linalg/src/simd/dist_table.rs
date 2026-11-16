@@ -141,6 +141,55 @@ pub fn sum_4bit_dist_table_uninit(
         .call(codes, dist_table, code_len, &mut dists[..n]);
 }
 
+/// [`sum_4bit_dist_table_uninit`] for codes whose layout the caller knows.
+///
+/// The dispatched kernel is chosen at build time, but a single binary can hold
+/// partitions in either layout: an index built with `krl_code_layout` stores
+/// KRL bytes, while an older one stores packed bytes. Scanning packed bytes
+/// with the KRL kernel (or the reverse) still computes the right distances but
+/// pays for the wrong shuffles, so the layout has to select the kernel at
+/// runtime.
+#[inline]
+pub fn sum_4bit_dist_table_uninit_for_layout(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [MaybeUninit<u16>],
+    codes_are_krl: bool,
+) {
+    #[cfg(all(target_arch = "aarch64", feature = "neon-dist-table-krl"))]
+    {
+        use std::sync::OnceLock;
+        // Both kernels are compiled in; pick per call from the data layout.
+        static KRL: OnceLock<SumU16Fn> = OnceLock::new();
+        static PACKED: OnceLock<SumU16Fn> = OnceLock::new();
+        let kernel = if codes_are_krl {
+            KRL.get_or_init(|| sum_neon_kernel::<true>)
+        } else {
+            PACKED.get_or_init(|| sum_neon_kernel::<false>)
+        };
+        // SAFETY: the kernel writes every output slot and asserts its own
+        // bounds, exactly as the dispatched entry does.
+        unsafe { kernel(codes, dist_table, code_len, &mut dists[..n]) };
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon-dist-table-krl")))]
+    {
+        let _ = codes_are_krl;
+        sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists);
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon-dist-table-krl"))]
+fn sum_neon_kernel<const KRL: bool>(
+    codes: &[u8],
+    dist_table: &[u8],
+    code_len: usize,
+    dists: &mut [MaybeUninit<u16>],
+) {
+    sum_neon_rows::<KRL>(codes, dist_table, code_len, dists);
+}
+
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(SUM_U16_SCALAR: SumU16Fn)]
@@ -262,9 +311,10 @@ pub fn sum_4bit_dist_table_neon(
 
 /// KRL `vsli` / 32-byte `tbl` / `vpadal` trial of [`sum_4bit_dist_table`].
 ///
-/// The stored distances do not match [`sum_4bit_dist_table_scalar`]: Lance's
-/// two subquantizers are contiguous 16-byte groups, and this kernel adds
-/// adjacent code bytes. It is a timing target for the `dist_table` benchmark.
+/// Adds adjacent code bytes. Byte `2k` must be one subquantizer and byte
+/// `2k+1` the next, for the same vectors. Lance `pack_codes` keeps those two
+/// subquantizers in separate 16-byte halves, so this kernel matches the scalar
+/// distances only after that layout has been rewritten.
 ///
 /// # Panics
 ///
@@ -3302,3 +3352,5 @@ mod tests {
         }
     }
 }
+
+

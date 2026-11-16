@@ -430,6 +430,7 @@ impl<S: IvfSubIndex> PartitionEntry<S, RabitQuantizer> {
             rotation_type: rotation_type_to_proto(metadata.rotation_type) as i32,
             query_estimator: query_estimator_to_proto(metadata.query_estimator) as i32,
             fast_rotation_signs: metadata.fast_rotation_signs.clone(),
+            krl_layout: metadata.krl_layout,
         };
 
         w.write_header(&header)?;
@@ -498,8 +499,10 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             rotation_type,
             code_dim: header.code_dim,
             num_bits: header.num_bits as u8,
-            // The storage batch already has packed codes; skip re-packing.
+            // The storage batch already has the final code layout; skip
+            // re-packing.
             packed: true,
+            krl_layout: header.krl_layout,
             query_estimator,
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(

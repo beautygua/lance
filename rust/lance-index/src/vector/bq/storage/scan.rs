@@ -224,6 +224,16 @@ impl RabitQuantizationStorage {
         } else {
             distance_type
         };
+        // The sign stage feeds `binary_distances_with_scratch`, which reads
+        // `fastscan_codes`. Under `neon-dist-table-krl` the dispatched kernel
+        // expects the KRL layout, so this path must build it too; leaving it
+        // `None` would hand packed bytes to the KRL kernel. A partition already
+        // stored in the KRL layout needs no second copy.
+        let krl_codes = if metadata.krl_layout {
+            None
+        } else {
+            crate::vector::bq::storage::krl_codes_from_lance(&codes)
+        };
         Ok(Self {
             metadata: metadata.clone(),
             batch,
@@ -235,6 +245,7 @@ impl RabitQuantizationStorage {
             error_factors,
             ex_codes: None,
             packed_ex_codes: None,
+            krl_codes,
             ex_add_factors: None,
             ex_scale_factors: None,
         })

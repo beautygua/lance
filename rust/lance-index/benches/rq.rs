@@ -252,6 +252,7 @@ fn ex_code_storage_load(c: &mut Criterion) {
         code_dim: LOAD_DIM as u32,
         num_bits: NUM_BITS,
         packed: true,
+        krl_layout: false,
         query_estimator: RabitQueryEstimator::RawQuery,
     };
     let code_len = LOAD_DIM / 8;
@@ -670,6 +671,7 @@ fn build_transform(c: &mut Criterion) {
                     code_dim: dim as u32,
                     num_bits,
                     packed: false,
+                    krl_layout: false,
                     query_estimator: RabitQueryEstimator::RawQuery,
                 };
                 let rq = RabitQuantizer::try_from(

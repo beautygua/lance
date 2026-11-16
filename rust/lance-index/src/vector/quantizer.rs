@@ -227,6 +227,8 @@ pub struct QuantizationMetadata {
     pub codebook_position: Option<usize>,
     pub codebook: Option<FixedSizeListArray>,
     pub transposed: bool,
+    // For RQ: codes are stored in the KRL adjacent-byte layout.
+    pub krl_layout: bool,
 }
 
 #[async_trait]
@@ -235,6 +237,12 @@ pub trait QuantizerMetadata:
 {
     /// Whether code bytes are laid out column-major across a whole partition.
     fn is_transposed(&self) -> bool {
+        false
+    }
+
+    /// Whether the codes on disk are already in the fast-scan layout, so no
+    /// separate copy has to be derived.
+    fn codes_are_fastscan_layout(&self) -> bool {
         false
     }
 
@@ -301,6 +309,40 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         Err(Error::not_supported(
             "sign-only preparation requires current native RaBitQ storage".to_string(),
         ))
+    }
+
+    /// Internal entry point for loaders that already hold the code layout the
+    /// fast-scan reads (e.g. a cached KRL copy), so the storage does not have
+    /// to derive it again. Implementations that have no such layout ignore it.
+    #[doc(hidden)]
+    fn try_from_batch_with_fastscan_codes(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        _fastscan_codes: Option<arrow_array::FixedSizeListArray>,
+    ) -> Result<Self> {
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)
+    }
+
+    /// Both of the above: the index-level quantizer plus a fast-scan layout the
+    /// caller already holds. Loaders that keep the quantizer use this one.
+    #[doc(hidden)]
+    fn try_from_batch_with_quantizer_and_fastscan_codes(
+        batch: RecordBatch,
+        quantizer: &Quantizer,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        _fastscan_codes: Option<arrow_array::FixedSizeListArray>,
+    ) -> Result<Self> {
+        Self::try_from_batch_with_quantizer(
+            batch,
+            quantizer,
+            metadata,
+            distance_type,
+            frag_reuse_index,
+        )
     }
 
     /// Internal entry point for loaders that retain the index-level quantizer.

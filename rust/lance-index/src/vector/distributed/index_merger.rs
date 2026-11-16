@@ -2753,6 +2753,7 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2885,6 +2886,7 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: true,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2947,6 +2949,7 @@ mod tests {
             code_dim: 16,
             num_bits: 4,
             packed: false,
+            krl_layout: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 

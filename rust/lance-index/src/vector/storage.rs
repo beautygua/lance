@@ -1824,7 +1824,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ) -> Result<PartitionCodes> {
         let columns = self.partition_code_columns()?;
         let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
-        Ok(PartitionCodes(
+        Ok(PartitionCodes::new(
             self.read_file_columns(self.ivf.row_range(part_id), &columns, io_stats)
                 .await?,
         ))
@@ -1838,7 +1838,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<PartitionCodes> {
-        Ok(PartitionCodes(compact_prewarm_batches(batches)?))
+        Ok(PartitionCodes::new(compact_prewarm_batches(batches)?))
     }
 
     /// The storage of native partition `part_id` built from `codes`, its
@@ -1861,7 +1861,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         load_stats: Option<&IoStats>,
     ) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        let entry = &codes.0;
+        let entry = &codes.batch;
         if entry.num_rows() != range.len() {
             return Err(Error::internal(format!(
                 "code-only entry of partition {part_id} holds {} rows of its {}",
@@ -1894,19 +1894,26 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             Some(store) => store.attach(schema, Some(entry), ResidentRows::Range(range), attach)?,
         };
         let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        // The code-only entry outlives this read, so it memoizes the fast-scan
+        // layout: deriving it here would rewrite the partition per query.
+        let fastscan_codes = codes
+            .krl_codes(self.metadata().codes_are_fastscan_layout())
+            .cloned();
         let storage = match &self.quantizer {
-            Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+            Some(quantizer) => Q::Storage::try_from_batch_with_quantizer_and_fastscan_codes(
                 batch,
                 quantizer,
                 self.metadata(),
                 self.distance_type,
                 remapper,
+                fastscan_codes,
             )?,
-            None => Q::Storage::try_from_batch_with_remapper(
+            None => Q::Storage::try_from_batch_with_fastscan_codes(
                 batch,
                 self.metadata(),
                 self.distance_type,
                 remapper,
+                fastscan_codes,
             )?,
         };
         let stats = scan_stats::counters();
@@ -1939,7 +1946,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                         .read_partition_codes(part_id, io_stats.as_ref())
                         .await?;
                     debug_assert!(
-                        !shares_resident_store(&codes.0),
+                        !shares_resident_store(&codes.batch),
                         "a code-only partition entry holds memory of a resident store"
                     );
                     Ok(codes)

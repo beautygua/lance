@@ -78,7 +78,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import LanceFragment
-from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
+from .indices import IndexConfig, IndexSegment, PcaParams, SupportedDistributedIndices
 from .lance import (
     CleanupExplanation,
     CleanupStats,
@@ -3614,10 +3614,14 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        krl_code_layout: bool = False,
         rabitq_model: Optional[str] = None,
+        pca: Optional[PcaParams] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
+        if pca is not None and not isinstance(pca, PcaParams):
+            raise TypeError(f"pca must be a PcaParams instance, got {type(pca)}")
         if not require_commit and fragment_ids is None:
             raise ValueError(
                 "create_index_uncommitted requires fragment_ids "
@@ -3961,8 +3965,63 @@ class LanceDataset(pa.dataset.Dataset):
         if skip_transpose:
             kwargs["skip_transpose"] = True
 
+        if krl_code_layout:
+            kwargs["krl_code_layout"] = True
+
         if rabitq_model is not None:
             kwargs["rabitq_model"] = rabitq_model
+
+        if pca is not None:
+            if index_type != "IVF_RQ":
+                raise ValueError("pca is only supported for IVF_RQ indices")
+            if metric.lower() not in ("l2", "euclidean"):
+                raise ValueError("pca requires the L2/euclidean metric")
+            if accelerator is not None:
+                raise ValueError("pca does not support accelerator builds")
+            if not filter_nan:
+                raise ValueError("pca requires filter_nan=True")
+            if not train:
+                raise ValueError("pca requires train=True")
+            if not require_commit:
+                raise ValueError("pca does not support create_index_uncommitted")
+            if fragment_ids is not None:
+                raise ValueError("pca does not support fragment_ids")
+            if ivf_centroids is not None or ivf_centroids_file is not None:
+                raise ValueError("pca does not support precomputed IVF centroids")
+            if rabitq_model is not None:
+                raise ValueError("pca does not support rabitq_model")
+            if precomputed_partition_dataset is not None:
+                raise ValueError("pca does not support precomputed_partition_dataset")
+
+            precomputed_keys = {
+                "precomputed_partitions_file",
+                "precomputed_shuffle_buffers",
+                "precomputed_shuffle_buffers_path",
+            }
+            provided_precomputed_keys = precomputed_keys.intersection(kwargs)
+            if provided_precomputed_keys:
+                provided = ", ".join(sorted(provided_precomputed_keys))
+                raise ValueError(
+                    f"pca does not support precomputed buffers: {provided}"
+                )
+
+            index_file_version = kwargs.get("index_file_version")
+            index_file_version = getattr(
+                index_file_version, "value", index_file_version
+            )
+            if (
+                isinstance(index_file_version, str)
+                and index_file_version.lower() == "legacy"
+            ):
+                raise ValueError("pca does not support the Legacy index file format")
+
+            kwargs.update(
+                {
+                    "pca_dimension": pca.dimension,
+                    "pca_sample_size": pca.sample_size,
+                    "pca_sampling_seed": pca.sampling_seed,
+                }
+            )
 
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
@@ -4024,6 +4083,8 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        krl_code_layout: bool = False,
+        pca: Optional[PcaParams] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -4267,6 +4328,8 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            krl_code_layout=krl_code_layout,
+            pca=pca,
             require_commit=True,
             **kwargs,
         )
@@ -4304,7 +4367,9 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        krl_code_layout: bool = False,
         rabitq_model: Optional[str] = None,
+        pca: Optional[PcaParams] = None,
         **kwargs,
     ) -> Index:
         """
@@ -4414,7 +4479,9 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            krl_code_layout=krl_code_layout,
             rabitq_model=rabitq_model,
+            pca=pca,
             require_commit=False,
             **kwargs,
         )

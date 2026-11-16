@@ -19,6 +19,7 @@ use chrono::{Duration, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::pca::PcaParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
@@ -4364,8 +4365,10 @@ fn prepare_vector_index_params(
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
     let mut rq_params = RQBuildParams::default();
+    let mut pca_params = None;
     let mut index_file_version = IndexFileVersion::V3;
     let mut skip_transpose = false;
+    let mut krl_code_layout = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -4518,6 +4521,26 @@ fn prepare_vector_index_params(
             rq_params.rotation = Some(meta);
         };
 
+        let pca_option_keys = ["pca_sample_size", "pca_sampling_seed"];
+        if let Some(dimension) = kwargs.get_item("pca_dimension")? {
+            let mut parsed = PcaParams::new(dimension.extract()?);
+            if let Some(value) = kwargs.get_item("pca_sample_size")? {
+                parsed = parsed.with_sample_size(value.extract()?);
+            }
+            if let Some(value) = kwargs.get_item("pca_sampling_seed")? {
+                parsed = parsed.with_sampling_seed(value.extract()?);
+            }
+            pca_params = Some(parsed);
+        } else {
+            for key in pca_option_keys {
+                if kwargs.get_item(key)?.is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "{key} requires pca_dimension"
+                    )));
+                }
+            }
+        }
+
         if let Some(version) = kwargs.get_item("index_file_version")? {
             let version: String = version.extract()?;
             index_file_version = IndexFileVersion::try_from(&version)
@@ -4526,6 +4549,10 @@ fn prepare_vector_index_params(
 
         if let Some(value) = kwargs.get_item("skip_transpose")? {
             skip_transpose = value.extract()?;
+        }
+
+        if let Some(value) = kwargs.get_item("krl_code_layout")? {
+            krl_code_layout = value.extract()?;
         }
     }
 
@@ -4572,6 +4599,8 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
+    params.pre_transform = pca_params.map(lance::index::vector::PreTransformParams::Pca);
+    params.krl_code_layout(krl_code_layout);
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?
     {

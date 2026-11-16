@@ -2566,7 +2566,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             for (partition, batches) in run.zip(batches) {
                 let codes = self.storage.partition_codes_from_batches(batches)?;
                 debug_assert!(
-                    !shares_resident_store(&codes.0),
+                    !shares_resident_store(&codes.batch),
                     "prewarmed codes of partition {partition} hold memory of a resident store"
                 );
                 self.index_cache

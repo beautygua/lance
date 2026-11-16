@@ -4103,6 +4103,80 @@ async fn test_build_ivf_rq(
     test_remap(params.clone(), nlist, recall_requirement).await;
 }
 
+/// A build with `krl_code_layout` writes the fast-scan layout to disk and
+/// records it in the metadata, and searching it keeps end-to-end recall.
+#[tokio::test]
+async fn test_ivf_rq_krl_code_layout_matches_packed() {
+    let test_dir = TempStrDir::default();
+    let test_uri = test_dir.as_str();
+    let (mut packed_ds, vectors) =
+        generate_f32_test_dataset_with_shape(test_uri, 512, 64, 0.0..1.0).await;
+
+    let ivf_params = IvfBuildParams::new(4);
+    let rq_params = RQBuildParams::with_rotation_type(5, RQRotationType::Fast);
+    let packed_params =
+        VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params.clone(), rq_params.clone());
+    packed_ds
+        .create_index(&["vector"], IndexType::Vector, None, &packed_params, true)
+        .await
+        .unwrap();
+
+    // A second dataset holding the very same vectors, built in the KRL layout.
+    let ids = Arc::new(UInt64Array::from_iter_values(0..vectors.len() as u64));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("vector", vectors.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, vectors.clone()]).unwrap();
+    let krl_uri = format!("{test_uri}/krl");
+    let mut krl_ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &krl_uri,
+        Some(WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut krl_params =
+        VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+    krl_params.krl_code_layout(true);
+    krl_ds
+        .create_index(&["vector"], IndexType::Vector, None, &krl_params, true)
+        .await
+        .unwrap();
+
+    // The KRL build must record the layout; the packed build must not.
+    let scheduler = ScanScheduler::new(
+        Arc::new(ObjectStore::local()),
+        SchedulerConfig::default_for_testing(),
+    );
+    let krl_indices = krl_ds.load_indices().await.unwrap();
+    let krl_meta = get_rq_metadata(
+        &krl_ds,
+        scheduler.clone(),
+        &krl_indices[0].uuid.to_string(),
+    )
+    .await;
+    assert!(krl_meta.krl_layout, "KRL build must record its layout");
+    let packed_indices = packed_ds.load_indices().await.unwrap();
+    let packed_meta = get_rq_metadata(
+        &packed_ds,
+        scheduler,
+        &packed_indices[0].uuid.to_string(),
+    )
+    .await;
+    assert!(!packed_meta.krl_layout, "packed build must not claim KRL");
+
+    // The two indexes train their own IVF centroids, so their distances are
+    // not bit-identical. What must hold is that the KRL build searches as
+    // accurately as the packed build.
+    test_recall::<Float32Type>(packed_params, 4, 0.9, "vector", &packed_ds, vectors.clone()).await;
+    test_recall::<Float32Type>(krl_params, 4, 0.9, "vector", &krl_ds, vectors).await;
+}
+
 #[rstest]
 #[case::l2(DistanceType::L2, 9)]
 #[case::cosine(DistanceType::Cosine, 9)]

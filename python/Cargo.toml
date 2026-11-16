@@ -90,6 +90,9 @@ default = ["extension-module"]
 datagen = ["lance-datagen"]
 extension-module = ["pyo3/extension-module"]
 fp16kernels = ["lance/fp16kernels"]
+# Write RQ codes in the KRL adjacent-byte layout and scan them with the KRL
+# NEON kernel. Exposed to Python as `create_index(..., krl_code_layout=True)`.
+neon-dist-table-krl = ["lance-index/neon-dist-table-krl"]
 
 [profile.ci]
 debug = "line-tables-only"

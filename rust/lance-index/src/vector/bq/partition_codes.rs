@@ -17,8 +17,10 @@
 //! ```
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
-use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::{FixedSizeListArray, RecordBatch};
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder,
@@ -33,12 +35,55 @@ const RAW_BODY_VERSION: u32 = 1;
 
 /// The code columns of a native IVF_RQ partition: the sign codes, packed,
 /// and the ex codes, blocked, at the partition's rows.
+///
+/// The entry also memoizes the KRL adjacent-byte layout of its sign codes.
+/// That layout is what the NEON fast-scan reads, and rewriting it costs a pass
+/// over the whole partition. A storage instance is rebuilt for every query, so
+/// building it there would repeat that pass per query; the code-only entry is
+/// shared across queries, so it is built once here instead.
 #[derive(Debug)]
-pub struct PartitionCodes(pub RecordBatch);
+pub struct PartitionCodes {
+    pub batch: RecordBatch,
+    krl_codes: OnceLock<Option<FixedSizeListArray>>,
+}
+
+impl PartitionCodes {
+    pub fn new(batch: RecordBatch) -> Self {
+        Self {
+            batch,
+            krl_codes: OnceLock::new(),
+        }
+    }
+
+    /// The sign codes of this partition in the KRL adjacent-byte layout.
+    ///
+    /// `None` when the build has no KRL kernel, or when the codes on disk are
+    /// already in that layout (a KRL-layout partition needs no second copy).
+    /// Built on first use and reused by every later query.
+    pub(crate) fn krl_codes(&self, codes_are_krl: bool) -> Option<&FixedSizeListArray> {
+        if codes_are_krl {
+            return None;
+        }
+        self.krl_codes
+            .get_or_init(|| {
+                let codes = self.batch.column_by_name(super::storage::RABIT_CODE_COLUMN)?;
+                super::storage::krl_codes_from_lance(codes.as_fixed_size_list())
+            })
+            .as_ref()
+    }
+}
 
 impl DeepSizeOf for PartitionCodes {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.0.deep_size_of_children(context)
+        self.batch.deep_size_of_children(context)
+            + self
+                .krl_codes
+                .get()
+                .and_then(|codes| codes.as_ref())
+                .map_or(0, |codes| {
+                    let values = codes.values();
+                    values.len() + std::mem::size_of_val(values.as_ref())
+                })
     }
 }
 
@@ -47,12 +92,13 @@ impl CacheCodecImpl for PartitionCodes {
     const CURRENT_VERSION: u32 = RAW_BODY_VERSION;
 
     fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
-        write_raw_batch(writer, &self.0)
+        // The KRL layout is derived state: it is rebuilt on the next load.
+        write_raw_batch(writer, &self.batch)
     }
 
     fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
         match reader.version() {
-            RAW_BODY_VERSION => Ok(Self(read_raw_batch(reader)?)),
+            RAW_BODY_VERSION => Ok(Self::new(read_raw_batch(reader)?)),
             version => Err(Error::invalid_input(format!(
                 "unsupported partition codes cache version {version}"
             ))),
@@ -138,7 +184,7 @@ mod tests {
         let mut encoded = Vec::new();
         codec
             .serialize(
-                &(Arc::new(PartitionCodes(batch.clone())) as Arc<dyn std::any::Any + Send + Sync>),
+                &(Arc::new(PartitionCodes::new(batch.clone())) as Arc<dyn std::any::Any + Send + Sync>),
                 &mut encoded,
             )
             .unwrap();
@@ -149,7 +195,7 @@ mod tests {
         let codec = PartitionCodesKey { partition: 0 }.codec_for_key().unwrap();
         match codec.deserialize(encoded) {
             CacheDecode::Hit(value) => {
-                CacheDecode::Hit(value.downcast::<PartitionCodes>().unwrap().0.clone())
+                CacheDecode::Hit(value.downcast::<PartitionCodes>().unwrap().batch.clone())
             }
             CacheDecode::Miss(reason) => CacheDecode::Miss(reason),
         }
@@ -176,8 +222,8 @@ mod tests {
             };
             assert_eq!(decoded, original, "rows={rows}");
             assert_eq!(
-                PartitionCodes(decoded).deep_size_of(),
-                PartitionCodes(original).deep_size_of(),
+                PartitionCodes::new(decoded).deep_size_of(),
+                PartitionCodes::new(original).deep_size_of(),
                 "rows={rows}"
             );
         }
