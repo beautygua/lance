@@ -2128,6 +2128,56 @@ async fn test_flat_knn_large_limit_preserves_global_order(
     );
 }
 
+/// An indexed search returns only `k * refine_factor` candidates, so spreading
+/// them over every partition adds metric setup and lock contention without any
+/// parallelism to gain. The plan must stay single-partitioned even when the
+/// scanner is told to use many partitions.
+#[rstest]
+#[tokio::test]
+async fn test_indexed_knn_plan_skips_round_robin(#[values(false, true)] refine: bool) {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+        .await
+        .unwrap();
+    test_ds.make_vector_index().await.unwrap();
+    let (queries, _) = batch_knn_two_queries();
+
+    let mut scan = test_ds.dataset.scan();
+    scan.nearest("vec", &queries, 10).unwrap();
+    scan.target_parallelism(8);
+    if refine {
+        scan.refine(5);
+    }
+    scan.project(&["i"]).unwrap();
+
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANN"),
+        "the fixture must produce an index-backed search, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("RepartitionExec"),
+        "an indexed vector search must not fan its candidates out across \
+         partitions, got:\n{plan}"
+    );
+
+    // A flat search has no ANN node and must keep the parallelism, since it
+    // scores every row.
+    let mut flat = test_ds.dataset.scan();
+    flat.nearest("vec", &queries, 10).unwrap();
+    flat.use_index(false);
+    flat.target_parallelism(8);
+    flat.project(&["i"]).unwrap();
+    let flat_plan = flat.explain_plan(false).await.unwrap();
+    assert!(
+        !flat_plan.contains("ANN"),
+        "use_index(false) must fall back to a flat scan, got:\n{flat_plan}"
+    );
+    assert!(
+        flat_plan.contains("RepartitionExec"),
+        "a flat vector search must keep round-robin parallelism, got:\n{flat_plan}"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_refine_factor(

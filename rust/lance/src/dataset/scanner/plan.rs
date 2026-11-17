@@ -49,7 +49,9 @@ use tracing::instrument;
 
 use crate::datatypes::Schema;
 use crate::io::exec::filtered_read::{FilteredReadExec, filter_read_columns};
-use crate::io::exec::knn::{QUERY_INDEX_COL, query_index_field};
+use crate::io::exec::knn::{
+    ANNIvfBatchExec, ANNIvfPartitionExec, ANNIvfSubIndexExec, QUERY_INDEX_COL, query_index_field,
+};
 use crate::io::exec::{
     AddRowOffsetExec, FilterPlan as ExprFilterPlan, LanceScanExec, Planner, get_physical_optimizer,
 };
@@ -1045,8 +1047,21 @@ impl Scanner {
         };
         // Round-robin partitions are merged back in order only by an ordering the
         // output declares; otherwise they arrive in whichever order they finish.
+        //
+        // An indexed vector search never needs it. The ANN scan parallelizes
+        // inside Lance, and everything above it works on a candidate set of
+        // `k * refine_factor` rows. Round-robin would fan those few rows out to
+        // `target_partitions`, and each partition builds its own full metric set
+        // on the shared `ExecutionPlanMetricsSet` mutex -- measurable lock
+        // contention for no parallelism. The row count that would veto it is
+        // `Inexact` (deleted rows may drop), and DataFusion ignores inexact
+        // estimates by default.
+        //
+        // Only an ANN node in the plan qualifies. A flat (unindexed) vector
+        // search sets `nearest` too but computes distances over the whole table,
+        // and that is exactly the work round-robin has to spread.
         options.optimizer.enable_round_robin_repartition =
-            !order_matters || visible_order.is_some();
+            !plan_has_ann_node(&plan) && (!order_matters || visible_order.is_some());
         if let Some(order) = visible_order {
             // `EnforceDistribution` then merges any partitions back in this order
             plan = Arc::new(OutputRequirementExec::new(
@@ -1182,6 +1197,30 @@ impl Scanner {
         )
         .await
     }
+}
+
+/// Whether `plan` contains an ANN search node, i.e. a vector search served by an
+/// index rather than by scoring every row.
+///
+/// The distinction matters for [`Scanner::create_plan`]'s round-robin decision:
+/// an indexed search returns only `k * refine_factor` candidates, so spreading
+/// them over every partition buys no parallelism, while a flat search scores the
+/// whole table and does need the spread.
+fn plan_has_ann_node(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    plan.apply(|node| {
+        if node.is::<ANNIvfPartitionExec>()
+            || node.is::<ANNIvfSubIndexExec>()
+            || node.is::<ANNIvfBatchExec>()
+        {
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })
+    .map(|recursion| matches!(recursion, TreeNodeRecursion::Stop))
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
