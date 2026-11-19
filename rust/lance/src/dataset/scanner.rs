@@ -128,8 +128,8 @@ use crate::io::exec::{
     LancePushdownScanExec, LanceScanExec, MinHashSearchExec, Planner, PreFilterSource,
     RowAddrMaskFilterExec, ScanConfig, TakeExec,
     knn::{
-        KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
-        query_index_field,
+        ANNIvfBatchExec, ANNIvfPartitionExec, ANNIvfSubIndexExec, KnnBatchParams, QUERY_INDEX_COL,
+        knn_empty_result_schema, new_knn_batch_exec, new_knn_exec, query_index_field,
     },
     project,
 };
@@ -3907,6 +3907,21 @@ impl Scanner {
         options.execution.target_partitions = self
             .target_parallelism
             .unwrap_or_else(get_num_compute_intensive_cpus);
+        // An indexed vector search never needs round-robin repartitioning. The
+        // ANN scan parallelizes inside Lance, and everything above it works on
+        // a candidate set of `k * refine_factor` rows. Round-robin would fan
+        // those few rows out to `target_partitions`, and each partition builds
+        // its own full metric set on the shared `ExecutionPlanMetricsSet`
+        // mutex -- measurable lock contention for no parallelism. The row count
+        // that would veto it is `Inexact` (deleted rows may drop), and
+        // DataFusion ignores inexact estimates by default.
+        //
+        // Only an ANN node in the plan qualifies. A flat (unindexed) vector
+        // search also sets `nearest` but computes distances over the whole
+        // table, and that is exactly the work round-robin has to spread.
+        if plan_has_ann_node(&plan) {
+            options.optimizer.enable_round_robin_repartition = false;
+        }
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -8537,6 +8552,31 @@ impl Scanner {
         )
         .await
     }
+}
+
+/// Whether `plan` contains an ANN search node, i.e. a vector search served by an
+/// index rather than by scoring every row.
+///
+/// The distinction matters for the round-robin decision in
+/// [`Scanner::create_plan_impl`]: an indexed search returns only
+/// `k * refine_factor` candidates, so spreading them over every partition buys
+/// no parallelism, while a flat search scores the whole table and does need the
+/// spread.
+fn plan_has_ann_node(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    plan.apply(|node| {
+        if node.is::<ANNIvfPartitionExec>()
+            || node.is::<ANNIvfSubIndexExec>()
+            || node.is::<ANNIvfBatchExec>()
+        {
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })
+    .map(|recursion| matches!(recursion, TreeNodeRecursion::Stop))
+    .unwrap_or(false)
 }
 
 // Search over all indexed fields including nested ones, collecting columns that have an
