@@ -12,7 +12,7 @@
 use core::f32;
 use std::cmp::Reverse;
 use std::ops::{AddAssign, DivAssign};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::vec;
 use std::{collections::HashMap, ops::MulAssign};
 
@@ -44,13 +44,51 @@ use rayon::prelude::*;
 use {
     lance_linalg::distance::{
         Dot,
-        l2::{L2, l2_distance_batch},
+        l2::{
+            L2, aarch64_norm_expansion_enabled, l2_distance_batch, l2_distance_batch_with_norms,
+        },
     },
     lance_linalg::kernels::argmin_value,
 };
 
 use crate::vector::utils::SimpleIndex;
 use lance_core::{Error, Result};
+
+/// Runtime switch for the blocked kmeans L2 assignment on aarch64.
+///
+/// When enabled (the default), each centroid is reused across a block of data
+/// vectors instead of being re-read for every vector. Set
+/// `LANCE_DISABLE_AARCH64_KMEANS_VECTOR_BLOCK=1` to use the per-vector path.
+fn aarch64_kmeans_vector_block_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        {
+            !matches!(
+                std::env::var("LANCE_DISABLE_AARCH64_KMEANS_VECTOR_BLOCK").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE")
+            )
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    })
+}
+
+/// Number of data vectors processed against one centroid at a time.
+///
+/// `LANCE_KMEANS_VECTOR_BLOCK` overrides the default of 8 (range 1..=64).
+fn kmeans_vector_block_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("LANCE_KMEANS_VECTOR_BLOCK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|size| (1..=64).contains(size))
+            .unwrap_or(8)
+    })
+}
 
 /// KMean initialization method.
 #[derive(Debug, Clone, PartialEq)]
@@ -549,6 +587,76 @@ where
                 })
                 .collect::<Vec<_>>(),
             None => match distance_type {
+                // On aarch64 f32, expand `||x - y||^2` and reuse the
+                // precomputed centroid norms so the hot loop is pure FMA.
+                DistanceType::L2
+                    if T::Native::NORM_EXPANSION && aarch64_norm_expansion_enabled() =>
+                {
+                    let centroid_norms: Vec<f32> = centroids
+                        .chunks_exact(dimension)
+                        .map(|centroid| T::Native::dot(centroid, centroid))
+                        .collect();
+                    let bias: Option<Vec<f32>> = cluster_sizes.map(|size| {
+                        size.iter()
+                            .map(|size| balance_factor * *size as f32)
+                            .collect()
+                    });
+                    if aarch64_kmeans_vector_block_enabled() {
+                        // Reuse each centroid across a block of vectors. The
+                        // centroid matrix is 4 MB at 4096 x 256, so the
+                        // per-vector scan streams it from L3 every time.
+                        let block_size = kmeans_vector_block_size();
+                        data.par_chunks(dimension * block_size)
+                            .map(|block| {
+                                let vecs: Vec<&[T::Native]> = block.chunks(dimension).collect();
+                                let nvec = vecs.len();
+                                let mut best_biased = vec![f32::INFINITY; nvec];
+                                let mut best_dist = vec![f32::INFINITY; nvec];
+                                let mut best_idx: Vec<Option<u32>> = vec![None; nvec];
+                                let mut norms = vec![0f32; nvec];
+                                for (b, vec) in vecs.iter().enumerate() {
+                                    norms[b] = T::Native::dot(vec, vec);
+                                }
+                                for (cidx, centroid) in
+                                    centroids.chunks_exact(dimension).enumerate()
+                                {
+                                    let centroid_norm = centroid_norms[cidx];
+                                    let bias_c = bias.as_ref().map_or(0.0, |bias| bias[cidx]);
+                                    for (b, vec) in vecs.iter().enumerate() {
+                                        let dot = T::Native::dot(centroid, vec);
+                                        let dist = norms[b] + centroid_norm - 2.0 * dot;
+                                        let biased = dist + bias_c;
+                                        if biased < best_biased[b] {
+                                            best_biased[b] = biased;
+                                            best_dist[b] = dist;
+                                            best_idx[b] = Some(cidx as u32);
+                                        }
+                                    }
+                                }
+                                (0..nvec)
+                                    .map(|b| best_idx[b].map(|idx| (idx, best_dist[b])))
+                                    .collect::<Vec<_>>()
+                            })
+                            .flatten()
+                            .collect::<Vec<_>>()
+                    } else {
+                        data.par_chunks(dimension)
+                            .map(|vec| {
+                                let vec_norm = T::Native::dot(vec, vec);
+                                argmin_value_float_with_bias(
+                                    l2_distance_batch_with_norms(
+                                        vec,
+                                        centroids,
+                                        dimension,
+                                        vec_norm,
+                                        &centroid_norms,
+                                    ),
+                                    bias.as_ref().map(|bias| bias.iter().copied()),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                }
                 DistanceType::L2 => data
                     .par_chunks(dimension)
                     .map(|vec| {

@@ -24,6 +24,7 @@ pub(crate) mod pairwise;
 pub mod prune;
 pub mod rotation;
 pub mod storage;
+mod threshold_sort;
 pub mod transform;
 
 pub const RABIT_MIN_NUM_BITS: u8 = 1;

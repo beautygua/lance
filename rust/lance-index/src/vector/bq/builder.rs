@@ -16,6 +16,8 @@ use num_traits::{AsPrimitive, FromPrimitive};
 use rand_distr::Distribution;
 use rayon::prelude::*;
 
+use super::threshold_sort::sort as radix_sort_positive_f32_indices;
+
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
     RabitQueryEstimator, rabit_binary_code_field, rabit_ex_code_field,
@@ -123,42 +125,6 @@ fn quantization_min_len(num_rows: usize) -> usize {
     // Leave enough jobs for load balancing while bounding scratch creation.
     // A fixed row minimum serializes small and trailing batches.
     (num_rows / (rayon::current_num_threads() * 4)).max(1)
-}
-
-/// Sort packed `(positive_f32_bits, index)` values by their floating-point key.
-///
-/// All thresholds emitted by [`best_ex_rescale_factor_with_scratch`] are positive and finite,
-/// so their IEEE-754 bit patterns have the same order as the represented values.
-/// Four stable byte-wise passes avoid the comparison-heavy tuple sort on every
-/// vector while preserving the exact threshold order.
-fn radix_sort_positive_f32_indices(values: &mut [u64], scratch: &mut Vec<u64>) {
-    if values.len() < 2 {
-        return;
-    }
-
-    fn pass(source: &[u64], destination: &mut [u64], shift: u32) {
-        let mut offsets = [0usize; 256];
-        for &value in source {
-            offsets[((value >> shift) & 0xff) as usize] += 1;
-        }
-        let mut next_offset = 0;
-        for offset in &mut offsets {
-            let count = *offset;
-            *offset = next_offset;
-            next_offset += count;
-        }
-        for &value in source {
-            let bucket = ((value >> shift) & 0xff) as usize;
-            destination[offsets[bucket]] = value;
-            offsets[bucket] += 1;
-        }
-    }
-
-    scratch.resize(values.len(), 0);
-    pass(values, scratch, 32);
-    pass(scratch, values, 40);
-    pass(values, scratch, 48);
-    pass(scratch, values, 56);
 }
 
 /// Sort RQ threshold events without changing the existing equal-key behavior.
