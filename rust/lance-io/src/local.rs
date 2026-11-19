@@ -190,6 +190,118 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Environment variable that disables the inline non-blocking read attempt in
+/// [`LocalObjectReader::get_range`] (restoring the pre-N17 behaviour of
+/// reading every range on the blocking pool), for A/B measurement.
+pub const LOCAL_READ_NOWAIT_DISABLED_ENV: &str = "LANCE_LOCAL_READ_NOWAIT_DISABLED";
+
+/// Largest range attempted inline.  Copying more than this out of the page
+/// cache would hold an async worker for longer than the blocking-pool round
+/// trip it saves; larger reads (whole-page scans) keep the blocking path.
+pub const LOCAL_READ_NOWAIT_MAX_BYTES: usize = 1 << 20;
+
+/// Non-blocking page-cache reads for local files.
+///
+/// A take of a few rows from a large file issues one small `pread` per row.
+/// Routing each through `spawn_blocking` costs two thread hand-offs (a futex
+/// wake of a pool thread, then of the async worker) that dwarf the read
+/// itself when the page is resident.  `preadv2(RWF_NOWAIT)` returns the
+/// resident bytes immediately and `EAGAIN` (or a short count) otherwise, so
+/// the common case completes on the calling thread and the miss case falls
+/// back to the blocking pool for the remainder.
+#[cfg(target_os = "linux")]
+mod nowait {
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use lance_core::utils::parse::str_is_truthy;
+
+    static DISABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var(super::LOCAL_READ_NOWAIT_DISABLED_ENV)
+            .map(|v| str_is_truthy(&v))
+            .unwrap_or(false)
+    });
+
+    /// Set once the kernel rejects the syscall or the flag; every later call
+    /// then skips straight to the blocking path.
+    static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+    /// Fill `buf` from `file` at `offset` without blocking.
+    ///
+    /// Returns the number of leading bytes that were read, which is short of
+    /// `buf.len()` when the rest of the range is not page-cache resident
+    /// (or at end of file, which the caller's blocking read then reports).
+    pub(super) fn try_read_at(file: &File, buf: &mut [u8], offset: u64) -> usize {
+        if buf.is_empty()
+            || buf.len() > super::LOCAL_READ_NOWAIT_MAX_BYTES
+            || *DISABLED
+            || UNSUPPORTED.load(Ordering::Relaxed)
+        {
+            return 0;
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            // The raw syscall splits the offset into two `unsigned long`
+            // halves; on 64-bit targets the low half carries the whole
+            // offset and the high half must be zero.
+            let pos_low = pos as libc::c_ulong;
+            let pos_high = if size_of::<libc::c_ulong>() >= 8 {
+                0
+            } else {
+                (pos >> 32) as libc::c_ulong
+            };
+            let iov = libc::iovec {
+                iov_base: buf[done..].as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len() - done,
+            };
+            // Safety: `iov` points into `buf`, which outlives the call, and
+            // the kernel writes at most `iov_len` bytes.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_preadv2,
+                    file.as_raw_fd(),
+                    &iov as *const libc::iovec,
+                    1 as libc::c_ulong,
+                    pos_low,
+                    pos_high,
+                    libc::RWF_NOWAIT as libc::c_ulong,
+                )
+            };
+            if rc > 0 {
+                done += rc as usize;
+                continue;
+            }
+            if rc == 0 {
+                // End of file
+                break;
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => break,
+                Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => {
+                    UNSUPPORTED.store(true, Ordering::Relaxed);
+                    break;
+                }
+                // Any other error is reported by the blocking read
+                _ => break,
+            }
+        }
+        done
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod nowait {
+    use std::fs::File;
+
+    pub(super) fn try_read_at(_file: &File, _buf: &mut [u8], _offset: u64) -> usize {
+        0
+    }
+}
+
 /// Await a filesystem operation running on a blocking thread, flattening the
 /// join and IO errors into a single `object_store` error.
 ///
@@ -329,19 +441,27 @@ impl Reader for LocalObjectReader {
 
         Box::pin(async move {
             let metrics = io_tracker.begin_io("get");
-            let result = join_local_io(tokio::task::spawn_blocking(move || {
-                let mut buf = BytesMut::with_capacity(range.len());
-                // Safety: `buf` is set with appropriate capacity above. It is
-                // written to below and we check all data is initialized at that point.
-                unsafe { buf.set_len(range.len()) };
-                #[cfg(unix)]
-                file.read_exact_at(buf.as_mut(), range.start as u64)?;
-                #[cfg(windows)]
-                read_exact_at(file, buf.as_mut(), range.start as u64)?;
+            let mut buf = BytesMut::with_capacity(range.len());
+            // Safety: `buf` is set with appropriate capacity above. It is
+            // written to below and we check all data is initialized at that point.
+            unsafe { buf.set_len(range.len()) };
 
+            let inline_bytes = nowait::try_read_at(&file, &mut buf, range.start as u64);
+
+            let result = if inline_bytes == range.len() {
                 Ok(buf.freeze())
-            }))
-            .await;
+            } else {
+                join_local_io(tokio::task::spawn_blocking(move || {
+                    let offset = range.start + inline_bytes;
+                    #[cfg(unix)]
+                    file.read_exact_at(&mut buf[inline_bytes..], offset as u64)?;
+                    #[cfg(windows)]
+                    read_exact_at(file, &mut buf[inline_bytes..], offset as u64)?;
+
+                    Ok(buf.freeze())
+                }))
+                .await
+            };
 
             metrics.record(&result, num_bytes);
             if result.is_ok() {

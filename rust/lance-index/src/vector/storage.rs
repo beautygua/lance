@@ -28,7 +28,10 @@ use std::{
     collections::BinaryHeap,
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -361,10 +364,29 @@ pub enum QueryResidual<'a> {
     },
 }
 
+/// Environment variable that restores eager pre-allocation of every pool
+/// slot at construction (the pre-N14 behaviour), for A/B measurement.
+pub const SCRATCH_POOL_EAGER_ENV: &str = "LANCE_SCRATCH_POOL_EAGER";
+
+static SCRATCH_POOL_EAGER: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os(SCRATCH_POOL_EAGER_ENV)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+});
+
+/// Bounded pool of query scratch buffers.
+///
+/// Holds at most `size` scratches. Scratches are allocated lazily on first
+/// use and kept for reuse when returned, so an index that serves one query
+/// at a time allocates one scratch, not one per CPU. (`IVFIndex` is rebuilt
+/// from its cached state on every query; with eager allocation that meant
+/// `num_cpus` x ~100 KB of `calloc` and page faults per query.)
 #[derive(Debug)]
 pub struct QueryScratchPool {
     scratches: ArrayQueue<QueryScratch>,
     scratch_capacity: QueryScratchCapacity,
+    /// Scratches allocated by this pool that may still be returned to it
+    /// (retained or checked out); bounded by `size`.
+    allocated: AtomicUsize,
 }
 
 impl QueryScratchPool {
@@ -374,28 +396,52 @@ impl QueryScratchPool {
 
     pub fn with_capacity(size: usize, capacity: QueryScratchCapacity) -> Self {
         let size = size.max(1);
-        let scratches = ArrayQueue::new(size);
-        for _ in 0..size {
-            scratches
-                .push(QueryScratch::with_capacity(capacity))
-                .expect("query scratch pool should have spare capacity during initialization");
-        }
-        Self {
-            scratches,
+        let pool = Self {
+            scratches: ArrayQueue::new(size),
             scratch_capacity: capacity,
+            allocated: AtomicUsize::new(0),
+        };
+        if *SCRATCH_POOL_EAGER {
+            pool.preallocate();
+        }
+        pool
+    }
+
+    /// Fill every free slot with an allocated scratch.
+    pub fn preallocate(&self) {
+        while self.scratches.len() < self.scratches.capacity() {
+            if self
+                .scratches
+                .push(QueryScratch::with_capacity(self.scratch_capacity))
+                .is_err()
+            {
+                break;
+            }
+            self.allocated.fetch_add(1, Ordering::Relaxed);
         }
     }
 
+    /// Maximum number of scratches the pool retains.
+    pub fn slots(&self) -> usize {
+        self.scratches.capacity()
+    }
+
+    /// Scratches allocated so far that may still be returned (retained or
+    /// checked out).
+    pub fn allocated(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed)
+    }
+
     pub fn scratch(&self) -> QueryScratchGuard<'_> {
-        let (scratch, pooled) = if let Some(scratch) = self.scratches.pop() {
-            (scratch, true)
-        } else {
-            (QueryScratch::with_capacity(self.scratch_capacity), false)
-        };
+        let scratch = self.scratches.pop().unwrap_or_else(|| {
+            // Allocated on demand; returned to the pool on drop if a slot is
+            // free, otherwise dropped.
+            self.allocated.fetch_add(1, Ordering::Relaxed);
+            QueryScratch::with_capacity(self.scratch_capacity)
+        });
         QueryScratchGuard {
             pool: self,
             scratch: Some(scratch),
-            pooled,
         }
     }
 
@@ -408,7 +454,6 @@ impl QueryScratchPool {
 pub struct QueryScratchGuard<'a> {
     pool: &'a QueryScratchPool,
     scratch: Option<QueryScratch>,
-    pooled: bool,
 }
 
 impl Deref for QueryScratchGuard<'_> {
@@ -431,13 +476,11 @@ impl DerefMut for QueryScratchGuard<'_> {
 
 impl Drop for QueryScratchGuard<'_> {
     fn drop(&mut self) {
-        if !self.pooled {
-            return;
-        }
         if let Some(scratch) = self.scratch.take() {
-            match self.pool.scratches.push(scratch) {
-                Ok(()) => {}
-                Err(_) => unreachable!("query scratch pool should not exceed its capacity"),
+            // Keep it for reuse if a slot is free; otherwise let it drop and
+            // stop counting it.
+            if self.pool.scratches.push(scratch).is_err() {
+                self.pool.allocated.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -451,7 +494,7 @@ impl DeepSizeOf for QueryScratchPool {
             total += scratch.deep_size_of_children(context);
             scratches.push(scratch);
         }
-        let checked_out = self.scratches.capacity().saturating_sub(scratches.len());
+        let checked_out = self.allocated().saturating_sub(scratches.len());
         total += checked_out * self.scratch_capacity.deep_size_bytes();
         for scratch in scratches {
             let _ = self.scratches.push(scratch);
@@ -1272,24 +1315,61 @@ mod tests {
         let pool =
             QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
         let pooled = pool.scratch();
-        assert!(pooled.pooled);
+        assert_eq!(pool.allocated(), 1);
 
+        // A second concurrent scratch exceeds the single slot: allocated on
+        // demand with the same capacity, dropped (not retained) on return.
         let temporary = pool.scratch();
-        assert!(!temporary.pooled);
         assert_eq!(temporary.distances.len(), 8);
         assert_eq!(temporary.query_f32.len(), 16);
         assert_eq!(temporary.u16.len(), 4);
         assert_eq!(temporary.u8.len(), 2);
         assert_eq!(temporary.u32.len(), 3);
+        drop(pooled);
+        drop(temporary);
+        assert_eq!(pool.allocated(), 1);
+        assert_eq!(pool.scratches.len(), 1);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_allocates_lazily_and_is_bounded() {
+        let pool =
+            QueryScratchPool::with_capacity(4, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
+        assert_eq!(pool.slots(), 4);
+        if pool.allocated() == 0 {
+            // Default (not LANCE_SCRATCH_POOL_EAGER): nothing until first use,
+            // and sequential use keeps reusing one scratch.
+            pool.with_scratch(|_| {});
+            assert_eq!(pool.allocated(), 1);
+            pool.with_scratch(|_| {});
+            assert_eq!(pool.allocated(), 1);
+            let live = [
+                pool.scratch(),
+                pool.scratch(),
+                pool.scratch(),
+                pool.scratch(),
+                pool.scratch(),
+            ];
+            assert_eq!(pool.allocated(), 5);
+            drop(live);
+            // Only `slots()` are retained; the extra one was dropped.
+            assert_eq!(pool.allocated(), 4);
+            assert_eq!(pool.scratches.len(), 4);
+        }
+        pool.preallocate();
+        assert_eq!(pool.allocated(), 4);
+        assert_eq!(pool.scratches.len(), 4);
     }
 
     #[test]
     fn test_query_scratch_pool_deep_size_includes_buffer_capacity() {
-        let empty_size = QueryScratchPool::new(1).deep_size_of();
         let pool =
             QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
+        pool.with_scratch(|_| {});
+        let empty_pool = QueryScratchPool::new(1);
+        empty_pool.with_scratch(|_| {});
 
-        assert!(pool.deep_size_of() > empty_size);
+        assert!(pool.deep_size_of() > empty_pool.deep_size_of());
 
         let idle_size = pool.deep_size_of();
         let _checked_out = pool.scratch();
