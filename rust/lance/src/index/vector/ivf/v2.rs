@@ -127,6 +127,16 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) aux_file_size: u64,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
+    /// The query scratch buffers, sized from the IVF model and the quantizer.
+    ///
+    /// Runtime-only, like `rq_search_cache`: the pool holds no index data, only
+    /// reusable buffers. Keeping it here means a reconstruction from cache
+    /// shares one pool instead of allocating a fresh set of buffers per query.
+    ///
+    /// Filled on the first reconstruction, which is where the storage that
+    /// decides the capacity is available; a state read back from a persistent
+    /// tier therefore starts empty and sizes itself on first use.
+    pub(crate) scratch_pool: OnceLock<Arc<QueryScratchPool>>,
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
@@ -628,6 +638,11 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
                 .and_then(|cache| cache.as_ref().and_then(|cache| cache.as_ref().cloned()))
                 .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
                 .unwrap_or_default()
+            + self
+                .scratch_pool
+                .get()
+                .map(|pool| pool.deep_size_of_children(context))
+                .unwrap_or_default()
     }
 }
 
@@ -735,6 +750,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
+                scratch_pool: OnceLock::new(),
             })))
         }
 
@@ -1676,8 +1692,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
+        scratch_pool: Option<Arc<QueryScratchPool>>,
     ) -> Result<Self> {
-        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
+        // Reuse the pool the state carried over, if it has one. Only the first
+        // reconstruction pays for the buffers; every later query on the same
+        // cached state shares them.
+        let scratch_pool = match scratch_pool {
+            Some(pool) => pool,
+            None => Arc::new(Self::query_scratch_pool(&ivf, &storage)),
+        };
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let read_projection = Self::read_projection(&reader)?;
@@ -2029,6 +2052,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
+            // Hand the live pool over so a reconstruction reuses these buffers
+            // instead of allocating a new set.
+            scratch_pool: OnceLock::from(self.scratch_pool.clone()),
         }))
     }
 }
@@ -3033,6 +3059,13 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
         .map_err(|e| Error::index(format!("Invalid UUID in IvfIndexState: {e}")))?;
+    // Size the scratch pool once per cached state, not once per query. The
+    // storage is bound by now, so this is the first point that can decide the
+    // capacity; later reconstructions clone the same `Arc`.
+    let scratch_pool = state
+        .scratch_pool
+        .get_or_init(|| Arc::new(IVFIndex::<S, Q>::query_scratch_pool(&state.ivf, &storage)))
+        .clone();
     let index = IVFIndex::<S, Q>::from_cached_state(
         to_local_path(&index_path),
         index_path.to_string(),
@@ -3045,6 +3078,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         index_cache,
         io_parallelism,
         rq_search_cache,
+        Some(scratch_pool),
     )?;
     Ok(Arc::new(index))
 }
