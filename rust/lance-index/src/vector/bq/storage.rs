@@ -2057,23 +2057,44 @@ fn accumulate_distances_into_heap(
     res: &mut BinaryHeap<OrderedNode<u64>>,
     dists: &[f32],
 ) {
-    let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
-    let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
-    let mut max_dist = res.peek().map(|node| node.dist);
-    for (id, dist) in dists.iter().copied().enumerate() {
-        let dist = OrderedFloat(dist);
-        if dist < lower_bound || dist >= upper_bound {
+    if k == 0 {
+        return;
+    }
+    let lower_bound = OrderedFloat(lower_bound.unwrap_or(f32::MIN));
+    let upper_bound = upper_bound.unwrap_or(f32::MAX);
+    // A row at or above the heap's worst distance can never enter it, and that
+    // worst only decreases as replacements land. One plain `f32` compare
+    // therefore rejects the bulk of the rows before any `OrderedFloat` work.
+    // While the heap is not full nothing is rejected but the upper bound.
+    // NaN fails `raw < threshold` and is skipped, which is what the
+    // `OrderedFloat` bound check did (`NaN >= upper_bound` is true there).
+    let mut threshold = if res.len() < k {
+        upper_bound
+    } else {
+        upper_bound.min(res.peek().map_or(f32::MAX, |node| node.dist.0))
+    };
+    for (id, &raw) in dists.iter().enumerate() {
+        if !(raw < threshold) {
+            continue;
+        }
+        let dist = OrderedFloat(raw);
+        if dist < lower_bound {
             continue;
         }
         if res.len() < k {
             res.push(OrderedNode::new(row_id(id as u32), dist));
             if res.len() == k {
-                max_dist = res.peek().map(|node| node.dist);
+                threshold = upper_bound.min(res.peek().map_or(f32::MAX, |node| node.dist.0));
             }
-        } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-            res.pop();
-            res.push(OrderedNode::new(row_id(id as u32), dist));
-            max_dist = res.peek().map(|node| node.dist);
+        } else {
+            // The threshold check above guarantees the new row is closer than
+            // the heap's worst, so replace it in place.
+            {
+                let mut top = res.peek_mut().unwrap();
+                top.id = row_id(id as u32);
+                top.dist = dist;
+            }
+            threshold = upper_bound.min(res.peek().map_or(f32::MAX, |node| node.dist.0));
         }
     }
 }
@@ -5109,5 +5130,134 @@ mod tests {
                  error {error} over the {quantization_bound} quantization bound",
             );
         }
+    }
+    /// Reference implementation: the straightforward per-row heap update with
+    /// no early threshold rejection.
+    fn accumulate_reference(
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &[f32],
+    ) {
+        let lower_bound: OrderedFloat = lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound: OrderedFloat = upper_bound.unwrap_or(f32::MAX).into();
+        let mut max_dist = res.peek().map(|node| node.dist);
+        for (id, dist) in dists.iter().copied().enumerate() {
+            let dist = OrderedFloat(dist);
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
+            if res.len() < k {
+                res.push(OrderedNode::new(id as u64, dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                {
+                    let mut top = res.peek_mut().unwrap();
+                    top.id = id as u64;
+                    top.dist = dist;
+                }
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+    }
+
+    fn heap_ids(res: &BinaryHeap<OrderedNode<u64>>) -> Vec<(u64, f32)> {
+        let mut out: Vec<(u64, f32)> = res.iter().map(|node| (node.id, node.dist.0)).collect();
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        out
+    }
+
+    /// The threshold-rejecting heap update must pick exactly the rows the
+    /// reference picks, including on ties, NaN and out-of-range values.
+    #[rstest]
+    #[case::plain(10, None, None)]
+    #[case::k_zero(0, None, None)]
+    #[case::k_one(1, None, None)]
+    #[case::k_exceeds_rows(1000, None, None)]
+    #[case::bounds(5, Some(0.25), Some(0.75))]
+    #[case::lower_only(5, Some(0.5), None)]
+    #[case::upper_only(5, None, Some(0.5))]
+    #[case::with_nan(5, None, None)]
+    #[case::with_inf(5, None, None)]
+    #[case::all_equal(5, None, None)]
+    fn test_accumulate_distances_into_heap_matches_reference(
+        #[case] k: usize,
+        #[case] lower: Option<f32>,
+        #[case] upper: Option<f32>,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(0x5eed);
+        let mut cases: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..16 {
+            let n = rng.random_range(0..300);
+            cases.push((0..n).map(|_| rng.random_range(-1.0f32..1.0f32)).collect());
+        }
+        // Degenerate inputs the threshold path could get wrong.
+        cases.push(vec![]);
+        cases.push(vec![f32::NAN, 0.1, 0.2, f32::NAN]);
+        cases.push(vec![f32::INFINITY, f32::NEG_INFINITY, 0.0]);
+        cases.push(vec![0.5; 64]);
+        cases.push(vec![f32::NAN; 8]);
+
+        for dists in cases {
+            let mut expected = BinaryHeap::new();
+            accumulate_reference(k, lower, upper, &mut expected, &dists);
+            let mut actual = BinaryHeap::new();
+            accumulate_distances_into_heap(k, lower, upper, |id| id as u64, &mut actual, &dists);
+            assert_eq!(
+                heap_ids(&expected),
+                heap_ids(&actual),
+                "k={k} lower={lower:?} upper={upper:?} dists={dists:?}",
+            );
+        }
+    }
+
+    /// The threshold only tightens as replacements land, so a pre-filled heap
+    /// must still accept every row that beats its worst member.
+    #[test]
+    fn test_accumulate_distances_into_heap_tightens_threshold() {
+        let mut res = BinaryHeap::new();
+        for id in 0..10u64 {
+            res.push(OrderedNode::new(id, OrderedFloat(10.0)));
+        }
+        let dists: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
+        accumulate_distances_into_heap(10, None, None, |id| id as u64, &mut res, &dists);
+        let ids: Vec<u64> = heap_ids(&res).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, (0..10).collect::<Vec<u64>>());
+    }
+
+    /// Rough timing of the threshold-rejecting path against the reference.
+    /// Run with `cargo test --release -- --ignored --nocapture` to see numbers;
+    /// it is ignored by default because debug timings say nothing.
+    #[test]
+    #[ignore]
+    fn bench_accumulate_distances_into_heap() {
+        let mut rng = SmallRng::seed_from_u64(7);
+        let dists: Vec<f32> = (0..9700).map(|_| rng.random_range(-1.0f32..1.0f32)).collect();
+        let rounds = 2000;
+        let k = 10;
+
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            let mut res = BinaryHeap::new();
+            accumulate_reference(k, None, None, &mut res, &dists);
+            std::hint::black_box(&res);
+        }
+        let reference = start.elapsed();
+
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            let mut res = BinaryHeap::new();
+            accumulate_distances_into_heap(k, None, None, |id| id as u64, &mut res, &dists);
+            std::hint::black_box(&res);
+        }
+        let threshold = start.elapsed();
+
+        println!(
+            "reference {reference:?} threshold {threshold:?} speedup {:.3}x",
+            reference.as_secs_f64() / threshold.as_secs_f64()
+        );
     }
 }
