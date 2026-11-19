@@ -11,7 +11,7 @@
 use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_sub_ps};
 use std::iter::Sum;
 use std::ops::AddAssign;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::{Error, Result};
 use arrow_array::{
@@ -46,6 +46,61 @@ use crate::distance::{BatchIter, BatchKernel, BatchKind, BatchOperation};
 ))]
 use crate::simd::x86::hsum256_ps;
 
+#[cfg(target_arch = "aarch64")]
+fn env_flag_disabled(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Runtime switch for the NEON f32 L2 kernel (patch 2).
+///
+/// When enabled (the default on aarch64), f32 L2 uses the explicit NEON
+/// kernel. Set `LANCE_DISABLE_AARCH64_NEON_L2=1` to use the pre-patch scalar
+/// kernel without recompiling. The legacy `LANCE_DISABLE_AARCH64_L2_FASTPATH=1`
+/// disables both this and the norm-expanded kmeans path.
+///
+/// The value is read once per process.
+pub fn aarch64_neon_l2_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        {
+            !env_flag_disabled("LANCE_DISABLE_AARCH64_L2_FASTPATH")
+                && !env_flag_disabled("LANCE_DISABLE_AARCH64_NEON_L2")
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    })
+}
+
+/// Runtime switch for the norm-expanded kmeans L2 assignment (patch 1).
+///
+/// When enabled (the default on aarch64), kmeans assignment computes L2 via
+/// `||x||^2 + ||y||^2 - 2 * x·y`. Set
+/// `LANCE_DISABLE_AARCH64_NORM_EXPANSION=1` to use the pre-patch direct L2
+/// path without recompiling. The legacy `LANCE_DISABLE_AARCH64_L2_FASTPATH=1`
+/// disables both this and the NEON L2 kernel.
+///
+/// The value is read once per process.
+pub fn aarch64_norm_expansion_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        {
+            !env_flag_disabled("LANCE_DISABLE_AARCH64_L2_FASTPATH")
+                && !env_flag_disabled("LANCE_DISABLE_AARCH64_NORM_EXPANSION")
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    })
+}
+
 /// Calculate the L2 distance between two vectors.
 ///
 pub trait L2: Num {
@@ -71,11 +126,58 @@ pub trait L2: Num {
         assert_batch_layout(x.len(), y.len(), dimension);
         y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
     }
+
+    /// Whether [`L2::l2_batch_from_norms`] can exploit precomputed squared norms.
+    ///
+    /// Only the aarch64 f32 implementation does; callers should skip computing
+    /// the norms when this is `false`.
+    const NORM_EXPANSION: bool = false;
+
+    /// L2 distance via `||x||^2 + ||y||^2 - 2 * x·y`.
+    ///
+    /// `x_norm` is `||x||^2` and `y_norms` holds one `||y||^2` per
+    /// `dimension`-sized vector in `y`. The default ignores the norms and
+    /// falls back to [`L2::l2_batch`].
+    ///
+    /// This trades a subtraction per element for a second dot product on the
+    /// norms. It is only a win where the FP pipes, not the load ports, are the
+    /// bottleneck (aarch64 NEON). It also loses relative precision for nearly
+    /// identical vectors, so it is intended for centroid assignment rather
+    /// than the general-purpose L2 API.
+    fn l2_batch_from_norms<'a>(
+        x: &'a [Self],
+        y: &'a [Self],
+        dimension: usize,
+        x_norm: f32,
+        y_norms: &'a [f32],
+    ) -> impl Iterator<Item = f32> + 'a {
+        let _ = (x_norm, y_norms);
+        Self::l2_batch(x, y, dimension)
+    }
 }
 
 #[inline]
 pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
     T::l2(from, to)
+}
+
+/// L2 distance from the norm expansion used by [`L2::l2_batch_from_norms`].
+///
+/// `dot` is `x·y`, and the two norms are squared (`||x||^2`, `||y||^2`).
+/// The result is clamped to zero because the expansion can go slightly
+/// negative when `x` and `y` are equal or nearly equal. NaN inputs propagate
+/// a NaN result rather than being clamped.
+#[inline]
+pub fn l2_from_norms(dot: f32, norm_x: f32, norm_y: f32) -> f32 {
+    let distance = norm_x + norm_y - 2.0 * dot;
+    // `f32::max` would turn a NaN distance into zero, which would make a
+    // NaN-containing vector look like an exact match. Propagate NaN instead;
+    // only clamp the small negative results of the expansion.
+    if distance.is_nan() {
+        distance
+    } else {
+        distance.max(0.0)
+    }
 }
 
 /// L2 distance between two f32 slices, dispatched to the widest SIMD backend
@@ -340,13 +442,48 @@ impl L2 for f32 {
         {
             l2_batch_f32_runtime_dispatch(x, y, dimension)
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            // `assert_batch_layout` proves every chunk has the same length as
+            // `x`, so call the private kernel directly instead of repeating
+            // the public `L2::l2` validation for every vector.
+            let kernel: fn(&[f32], &[f32]) -> f32 = if aarch64_neon_l2_enabled() {
+                aarch64::l2_f32_neon
+            } else {
+                l2_f32_scalar
+            };
+            y.chunks_exact(dimension).map(move |v| kernel(x, v))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             // `assert_batch_layout` proves every chunk has the same length as
             // `x`, so call the private kernel directly instead of repeating
             // the public `L2::l2` validation for every vector.
             y.chunks_exact(dimension)
                 .map(move |v| l2_f32_dispatched(x, v))
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    const NORM_EXPANSION: bool = true;
+
+    fn l2_batch_from_norms<'a>(
+        x: &'a [Self],
+        y: &'a [Self],
+        dimension: usize,
+        x_norm: f32,
+        y_norms: &'a [f32],
+    ) -> impl Iterator<Item = f32> + 'a {
+        #[cfg(target_arch = "aarch64")]
+        {
+            y.chunks_exact(dimension)
+                .zip(y_norms.iter().copied())
+                .map(move |(v, y_norm)| l2_from_norms(aarch64::dot_f32_neon(x, v), x_norm, y_norm))
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (x_norm, y_norms);
+            <Self as L2>::l2_batch(x, y, dimension)
         }
     }
 }
@@ -477,8 +614,8 @@ unsafe fn l2_batch_f32_scalar(x: &[f32], batch: &[f32], dimension: usize, output
 }
 
 /// L2 distance for f32, runtime-dispatched via `SIMD_SUPPORT` on x86_64
-/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses the
-/// auto-vectorised scalar loop.
+/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). aarch64 uses the explicit
+/// NEON kernel; other architectures use the auto-vectorised scalar loop.
 #[inline]
 fn l2_f32_dispatched(x: &[f32], y: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -490,7 +627,15 @@ fn l2_f32_dispatched(x: &[f32], y: &[f32]) -> f32 {
             _ => l2_f32_scalar(x, y),
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        if aarch64_neon_l2_enabled() {
+            aarch64::l2_f32_neon(x, y)
+        } else {
+            l2_f32_scalar(x, y)
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         l2_f32_scalar(x, y)
     }
@@ -792,6 +937,225 @@ mod x86 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64 {
+    use std::arch::aarch64::*;
+
+    /// NEON path for f32: eight `float32x4_t` accumulators over 32 values
+    /// per iteration, then 16- and 4-wide loops and a scalar tail.
+    #[inline]
+    pub(super) fn l2_f32_neon(x: &[f32], y: &[f32]) -> f32 {
+        // Every load is bounded by `dim`, so no read crosses either slice.
+        unsafe {
+            // Callers pass equal lengths; `min` keeps the unchecked loads
+            // in bounds for any input, as a safe function must.
+            let dim = x.len().min(y.len());
+            let mut i = 0usize;
+
+            let mut a0 = vdupq_n_f32(0.0);
+            let mut a1 = vdupq_n_f32(0.0);
+            let mut a2 = vdupq_n_f32(0.0);
+            let mut a3 = vdupq_n_f32(0.0);
+            let mut a4 = vdupq_n_f32(0.0);
+            let mut a5 = vdupq_n_f32(0.0);
+            let mut a6 = vdupq_n_f32(0.0);
+            let mut a7 = vdupq_n_f32(0.0);
+            while i + 32 <= dim {
+                let d0 = vsubq_f32(vld1q_f32(x.as_ptr().add(i)), vld1q_f32(y.as_ptr().add(i)));
+                let d1 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 4)),
+                    vld1q_f32(y.as_ptr().add(i + 4)),
+                );
+                let d2 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 8)),
+                    vld1q_f32(y.as_ptr().add(i + 8)),
+                );
+                let d3 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 12)),
+                    vld1q_f32(y.as_ptr().add(i + 12)),
+                );
+                let d4 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 16)),
+                    vld1q_f32(y.as_ptr().add(i + 16)),
+                );
+                let d5 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 20)),
+                    vld1q_f32(y.as_ptr().add(i + 20)),
+                );
+                let d6 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 24)),
+                    vld1q_f32(y.as_ptr().add(i + 24)),
+                );
+                let d7 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 28)),
+                    vld1q_f32(y.as_ptr().add(i + 28)),
+                );
+                a0 = vfmaq_f32(a0, d0, d0);
+                a1 = vfmaq_f32(a1, d1, d1);
+                a2 = vfmaq_f32(a2, d2, d2);
+                a3 = vfmaq_f32(a3, d3, d3);
+                a4 = vfmaq_f32(a4, d4, d4);
+                a5 = vfmaq_f32(a5, d5, d5);
+                a6 = vfmaq_f32(a6, d6, d6);
+                a7 = vfmaq_f32(a7, d7, d7);
+                i += 32;
+            }
+
+            if i + 16 <= dim {
+                let d0 = vsubq_f32(vld1q_f32(x.as_ptr().add(i)), vld1q_f32(y.as_ptr().add(i)));
+                let d1 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 4)),
+                    vld1q_f32(y.as_ptr().add(i + 4)),
+                );
+                let d2 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 8)),
+                    vld1q_f32(y.as_ptr().add(i + 8)),
+                );
+                let d3 = vsubq_f32(
+                    vld1q_f32(x.as_ptr().add(i + 12)),
+                    vld1q_f32(y.as_ptr().add(i + 12)),
+                );
+                a0 = vfmaq_f32(a0, d0, d0);
+                a1 = vfmaq_f32(a1, d1, d1);
+                a2 = vfmaq_f32(a2, d2, d2);
+                a3 = vfmaq_f32(a3, d3, d3);
+                i += 16;
+            }
+
+            while i + 4 <= dim {
+                let d = vsubq_f32(vld1q_f32(x.as_ptr().add(i)), vld1q_f32(y.as_ptr().add(i)));
+                a0 = vfmaq_f32(a0, d, d);
+                i += 4;
+            }
+
+            let s0 = vaddq_f32(
+                vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)),
+                vaddq_f32(vaddq_f32(a4, a5), vaddq_f32(a6, a7)),
+            );
+            let sum = vaddvq_f32(s0);
+
+            let tail: f32 = x[i..]
+                .iter()
+                .zip(y[i..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            sum + tail
+        }
+    }
+
+    /// NEON dot product: eight `float32x4_t` accumulators over 32 values per
+    /// iteration, then 16- and 4-wide loops and a scalar tail.
+    ///
+    /// Used by the norm-expanded L2 path, where removing the per-element
+    /// subtraction leaves the aarch64 FP pipes as the bottleneck.
+    #[inline]
+    pub(super) fn dot_f32_neon(x: &[f32], y: &[f32]) -> f32 {
+        unsafe {
+            let dim = x.len().min(y.len());
+            let mut i = 0usize;
+
+            let mut a0 = vdupq_n_f32(0.0);
+            let mut a1 = vdupq_n_f32(0.0);
+            let mut a2 = vdupq_n_f32(0.0);
+            let mut a3 = vdupq_n_f32(0.0);
+            let mut a4 = vdupq_n_f32(0.0);
+            let mut a5 = vdupq_n_f32(0.0);
+            let mut a6 = vdupq_n_f32(0.0);
+            let mut a7 = vdupq_n_f32(0.0);
+            while i + 32 <= dim {
+                a0 = vfmaq_f32(
+                    a0,
+                    vld1q_f32(x.as_ptr().add(i)),
+                    vld1q_f32(y.as_ptr().add(i)),
+                );
+                a1 = vfmaq_f32(
+                    a1,
+                    vld1q_f32(x.as_ptr().add(i + 4)),
+                    vld1q_f32(y.as_ptr().add(i + 4)),
+                );
+                a2 = vfmaq_f32(
+                    a2,
+                    vld1q_f32(x.as_ptr().add(i + 8)),
+                    vld1q_f32(y.as_ptr().add(i + 8)),
+                );
+                a3 = vfmaq_f32(
+                    a3,
+                    vld1q_f32(x.as_ptr().add(i + 12)),
+                    vld1q_f32(y.as_ptr().add(i + 12)),
+                );
+                a4 = vfmaq_f32(
+                    a4,
+                    vld1q_f32(x.as_ptr().add(i + 16)),
+                    vld1q_f32(y.as_ptr().add(i + 16)),
+                );
+                a5 = vfmaq_f32(
+                    a5,
+                    vld1q_f32(x.as_ptr().add(i + 20)),
+                    vld1q_f32(y.as_ptr().add(i + 20)),
+                );
+                a6 = vfmaq_f32(
+                    a6,
+                    vld1q_f32(x.as_ptr().add(i + 24)),
+                    vld1q_f32(y.as_ptr().add(i + 24)),
+                );
+                a7 = vfmaq_f32(
+                    a7,
+                    vld1q_f32(x.as_ptr().add(i + 28)),
+                    vld1q_f32(y.as_ptr().add(i + 28)),
+                );
+                i += 32;
+            }
+
+            if i + 16 <= dim {
+                a0 = vfmaq_f32(
+                    a0,
+                    vld1q_f32(x.as_ptr().add(i)),
+                    vld1q_f32(y.as_ptr().add(i)),
+                );
+                a1 = vfmaq_f32(
+                    a1,
+                    vld1q_f32(x.as_ptr().add(i + 4)),
+                    vld1q_f32(y.as_ptr().add(i + 4)),
+                );
+                a2 = vfmaq_f32(
+                    a2,
+                    vld1q_f32(x.as_ptr().add(i + 8)),
+                    vld1q_f32(y.as_ptr().add(i + 8)),
+                );
+                a3 = vfmaq_f32(
+                    a3,
+                    vld1q_f32(x.as_ptr().add(i + 12)),
+                    vld1q_f32(y.as_ptr().add(i + 12)),
+                );
+                i += 16;
+            }
+
+            while i + 4 <= dim {
+                a0 = vfmaq_f32(
+                    a0,
+                    vld1q_f32(x.as_ptr().add(i)),
+                    vld1q_f32(y.as_ptr().add(i)),
+                );
+                i += 4;
+            }
+
+            let s0 = vaddq_f32(
+                vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)),
+                vaddq_f32(vaddq_f32(a4, a5), vaddq_f32(a6, a7)),
+            );
+            let mut sum = vaddvq_f32(s0);
+            for (&a, &b) in x[i..].iter().zip(y[i..].iter()) {
+                sum += a * b;
+            }
+            sum
+        }
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn l2_f64_simd_other(x: &[f64], y: &[f64]) -> f32 {
@@ -959,6 +1323,24 @@ pub fn l2_distance_batch<'a, T: L2>(
     dimension: usize,
 ) -> impl Iterator<Item = f32> + 'a {
     T::l2_batch(from, to, dimension)
+}
+
+/// L2 distance from `from` to each `dimension`-sized vector in `to`, using
+/// precomputed squared norms (`||from||^2` and one `||to_i||^2` each).
+///
+/// Falls back to [`l2_distance_batch`] for types/architectures where
+/// [`L2::NORM_EXPANSION`] is `false`.
+pub fn l2_distance_batch_with_norms<'a, T: L2>(
+    from: &'a [T],
+    to: &'a [T],
+    dimension: usize,
+    from_norm: f32,
+    to_norms: &'a [f32],
+) -> impl Iterator<Item = f32> + 'a {
+    assert_batch_layout(from.len(), to.len(), dimension);
+    assert_eq!(to_norms.len(), to.len() / dimension);
+
+    T::l2_batch_from_norms(from, to, dimension, from_norm, to_norms)
 }
 
 fn do_l2_distance_arrow_batch<T: ArrowFloatType>(
@@ -1561,5 +1943,86 @@ mod tests {
             return;
         }
         check_l2_batch_kernel(x86::l2_batch_f32_avx512);
+    }
+
+    #[test]
+    fn test_l2_from_norms_matches_direct() {
+        use crate::distance::Dot;
+
+        for dim in [1usize, 7, 16, 17, 100, 1024, 2176] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.25 - 3.0).collect();
+            let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.5 + 1.0).collect();
+            let x_norm = <f32 as Dot>::dot(&x, &x);
+            let y_norm = <f32 as Dot>::dot(&y, &y);
+            let expanded = l2_from_norms(<f32 as Dot>::dot(&x, &y), x_norm, y_norm);
+            let direct = l2(&x, &y);
+            assert!(
+                (expanded - direct).abs() <= 1e-5 * direct.abs().max(1.0),
+                "dim {dim}: expanded={expanded} direct={direct}"
+            );
+            // Equal vectors must not produce a negative distance.
+            assert_eq!(l2_from_norms(x_norm, x_norm, x_norm), 0.0);
+        }
+        // NaN must propagate so callers still see "no valid distance".
+        assert!(l2_from_norms(f32::NAN, 1.0, 1.0).is_nan());
+        assert!(l2_from_norms(0.0, f32::NAN, 1.0).is_nan());
+        assert!(l2_from_norms(0.0, 1.0, f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_l2_batch_from_norms_matches_direct() {
+        use crate::distance::Dot;
+
+        for dim in [1usize, 7, 16, 17, 100, 1024, 2176] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.125 - 2.0).collect();
+            let y: Vec<f32> = (0..3 * dim).map(|i| (i as f32) * -0.375 + 1.0).collect();
+            let x_norm = <f32 as Dot>::dot(&x, &x);
+            let y_norms: Vec<f32> = y
+                .chunks_exact(dim)
+                .map(|v| <f32 as Dot>::dot(v, v))
+                .collect();
+            let got: Vec<f32> =
+                l2_distance_batch_with_norms(&x, &y, dim, x_norm, &y_norms).collect();
+            let want: Vec<f32> = l2_distance_batch(&x, &y, dim).collect();
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                    "dim {dim} vec {i}: got={g} want={w}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_l2_f32_neon_matches_scalar() {
+        for dim in [1usize, 3, 4, 7, 15, 16, 17, 31, 32, 33, 64, 100, 1024, 2176] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.125 - 2.0).collect();
+            let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.375 + 1.0).collect();
+            let got = super::aarch64::l2_f32_neon(&x, &y);
+            let want = l2_f32_scalar(&x, &y);
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "dim {dim}: got={got} want={want}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_dot_f32_neon_matches_scalar() {
+        use crate::distance::Dot;
+
+        for dim in [1usize, 3, 4, 7, 15, 16, 17, 31, 32, 33, 64, 100, 1024, 2176] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.125 - 2.0).collect();
+            let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.375 + 1.0).collect();
+            let got = super::aarch64::dot_f32_neon(&x, &y);
+            let want = <f32 as Dot>::dot(&x, &y);
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "dim {dim}: got={got} want={want}"
+            );
+        }
     }
 }
