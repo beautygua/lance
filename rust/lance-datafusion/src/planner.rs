@@ -1557,6 +1557,32 @@ mod tests {
         assert_eq!(actual.as_ref(), expected.as_ref());
     }
 
+    /// The `parse_expr` fast path unwraps exactly one backtick-quoted
+    /// identifier and declines anything else, so it never changes how a more
+    /// complex expression is parsed.
+    #[test]
+    fn test_single_quoted_identifier() {
+        assert_eq!(
+            Planner::single_quoted_identifier("`id`"),
+            Some("id".to_string())
+        );
+        assert_eq!(
+            Planner::single_quoted_identifier("`a``b`"),
+            Some("a`b".to_string())
+        );
+        assert_eq!(
+            Planner::single_quoted_identifier("`order`"),
+            Some("order".to_string())
+        );
+        // Not a single quoted identifier.
+        assert_eq!(Planner::single_quoted_identifier("id"), None);
+        assert_eq!(Planner::single_quoted_identifier("``"), None);
+        assert_eq!(Planner::single_quoted_identifier("`a` + 1"), None);
+        assert_eq!(Planner::single_quoted_identifier("`a`.`b`"), None);
+        assert_eq!(Planner::single_quoted_identifier(" `a`"), None);
+        assert_eq!(Planner::single_quoted_identifier("`a`b`"), None);
+    }
+
     #[test]
     fn test_parse_expr_with_relations_uses_sql_path() {
         let planner = Planner::new(column_resolution_schema()).with_enable_relations(true);

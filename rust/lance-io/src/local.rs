@@ -571,3 +571,105 @@ impl Writer for tokio::fs::File {
         Ok(WriteResult { size, e_tag: None })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use object_store::path::Path;
+
+    use super::*;
+
+    /// The inline `preadv2(RWF_NOWAIT)` prefix and the blocking remainder must
+    /// together return exactly what a plain blocking read returns, for ranges
+    /// that hit the page cache, span pages, sit at EOF, and exceed the inline
+    /// cap.
+    #[tokio::test]
+    async fn test_get_range_inline_and_blocking_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.bin");
+        let data: Vec<u8> = (0..(LOCAL_READ_NOWAIT_MAX_BYTES + 8192))
+            .map(|i| (i * 31 + 7) as u8)
+            .collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+
+        let store_path = Path::from_filesystem_path(&path).unwrap();
+        let reader = LocalObjectReader::open(&store_path, 4096, None)
+            .await
+            .unwrap();
+
+        let cases = [
+            0..3840usize,
+            4093..4099,
+            0..LOCAL_READ_NOWAIT_MAX_BYTES,
+            0..(LOCAL_READ_NOWAIT_MAX_BYTES + 1),
+            (data.len() - 10)..data.len(),
+            5..5,
+        ];
+        for range in cases {
+            let got = reader.get_range(range.clone()).await.unwrap();
+            assert_eq!(&got[..], &data[range.clone()], "range {range:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_range_past_eof_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.bin");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&[1u8; 16])
+            .unwrap();
+        let store_path = Path::from_filesystem_path(&path).unwrap();
+        let reader = LocalObjectReader::open(&store_path, 4096, None)
+            .await
+            .unwrap();
+
+        assert!(reader.get_range(8..32).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_try_read_at_reads_resident_bytes() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resident.bin");
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // Warm the page cache so the inline read can complete.
+        let mut warm = vec![0u8; data.len()];
+        file.read_exact_at(&mut warm, 0).unwrap();
+
+        let mut buf = vec![0u8; 128];
+        let read = nowait::try_read_at(&file, &mut buf, 64);
+        // Filesystems without `RWF_NOWAIT` support (tmpfs, for one) make the
+        // helper decline, which is the documented fallback. When it does read,
+        // the bytes must be the file's.
+        assert!(
+            read == 0 || read == 128,
+            "unexpected inline byte count {read}"
+        );
+        if read > 0 {
+            assert_eq!(&buf[..read], &data[64..64 + read]);
+        }
+
+        // An empty buffer reads nothing and does not touch the file.
+        assert_eq!(nowait::try_read_at(&file, &mut [], 0), 0);
+
+        // Over the inline cap the helper declines and the caller falls back.
+        let mut big = vec![0u8; LOCAL_READ_NOWAIT_MAX_BYTES + 1];
+        assert_eq!(nowait::try_read_at(&file, &mut big, 0), 0);
+
+        // Reading at EOF yields no bytes.
+        let mut tail = vec![0u8; 16];
+        assert_eq!(nowait::try_read_at(&file, &mut tail, data.len() as u64), 0);
+    }
+}

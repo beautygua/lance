@@ -3965,6 +3965,92 @@ mod tests {
         (batch, schema)
     }
 
+    /// A second open of the same index in the same store and session must
+    /// return the very same live index, while a new session must get its own.
+    #[tokio::test]
+    async fn test_reconstructed_vector_index_is_reused_per_store() {
+        const NUM_ROWS: usize = 256;
+        let (batch, schema) = make_seeded_vector_batch(NUM_ROWS);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ivf = IvfBuildParams::new(1);
+        ivf.centroids = Some(Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap(),
+        ));
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("reuse".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let meta = dataset.load_indices_by_name("reuse").await.unwrap();
+        let uuid = meta[0].uuid;
+        // The reconstructed-index cache is consulted only after the index
+        // state is cached, so warm it first.
+        dataset.prewarm_index("reuse").await.unwrap();
+
+        // The first open reconstructs from the cached state; the next one must
+        // hit the reconstructed-index cache and hand back the same `Arc`.
+        let first = dataset
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let second = dataset
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the same store and session must reuse the reconstructed index"
+        );
+
+        // A clone shares the underlying store and session.
+        let cloned = dataset.clone();
+        let third = cloned
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &third));
+
+        // A different object store must not share the handle.
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "credential_generation".to_owned(),
+                    "reconstructed-index-test".to_owned(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let (other_store, _) = ObjectStore::from_uri_and_params(
+            dataset.session().store_registry(),
+            dataset.uri(),
+            &store_params,
+        )
+        .await
+        .unwrap();
+        let with_other_store = dataset.with_object_store(other_store, Some(store_params));
+        let fourth = with_other_store
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &fourth),
+            "a different object store must get its own reconstructed index"
+        );
+    }
+
     #[rstest]
     #[case::flat(None)]
     #[case::pq4(Some(4))]
