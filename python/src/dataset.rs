@@ -5220,6 +5220,7 @@ fn prepare_vector_index_params(
     let mut pca_params = None;
     let mut index_file_version = IndexFileVersion::V3;
     let mut skip_transpose = false;
+    let mut krl_code_layout = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -5416,6 +5417,10 @@ fn prepare_vector_index_params(
         if let Some(value) = kwargs.get_item("skip_transpose")? {
             skip_transpose = value.extract()?;
         }
+
+        if let Some(value) = kwargs.get_item("krl_code_layout")? {
+            krl_code_layout = value.extract()?;
+        }
     }
 
     let mut params = match index_type {
@@ -5461,6 +5466,7 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
+    params.krl_code_layout(krl_code_layout);
     params.pre_transform = pca_params.map(lance::index::vector::PreTransformParams::Pca);
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?

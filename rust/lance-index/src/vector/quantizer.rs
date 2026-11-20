@@ -222,6 +222,8 @@ pub struct QuantizationMetadata {
     pub codebook_position: Option<usize>,
     pub codebook: Option<FixedSizeListArray>,
     pub transposed: bool,
+    // For RQ: codes are stored in the KRL adjacent-byte layout.
+    pub krl_layout: bool,
 }
 
 #[async_trait]

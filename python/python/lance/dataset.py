@@ -3984,6 +3984,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        krl_code_layout: bool = False,
         rabitq_model: Optional[str] = None,
         pca: Optional[PcaParams] = None,
         require_commit: bool = True,
@@ -4391,6 +4392,9 @@ class LanceDataset(pa.dataset.Dataset):
         if skip_transpose:
             kwargs["skip_transpose"] = True
 
+        if krl_code_layout:
+            kwargs["krl_code_layout"] = True
+
         if rabitq_model is not None:
             kwargs["rabitq_model"] = rabitq_model
 
@@ -4454,6 +4458,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        krl_code_layout: bool = False,
         pca: Optional[PcaParams] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
@@ -4731,6 +4736,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            krl_code_layout=krl_code_layout,
             pca=pca,
             require_commit=True,
             **kwargs,
@@ -4769,6 +4775,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        krl_code_layout: bool = False,
         rabitq_model: Optional[str] = None,
         pca: Optional[PcaParams] = None,
         **kwargs,
@@ -4882,6 +4889,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            krl_code_layout=krl_code_layout,
             rabitq_model=rabitq_model,
             pca=pca,
             require_commit=False,

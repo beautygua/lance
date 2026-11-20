@@ -19427,6 +19427,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     pre_transform: None,
                     version: crate::index::vector::IndexFileVersion::Legacy,
                     skip_transpose: false,
+                    krl_code_layout: false,
                     runtime_hints: Default::default(),
                 },
                 false,
