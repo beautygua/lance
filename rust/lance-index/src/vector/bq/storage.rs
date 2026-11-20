@@ -3294,6 +3294,24 @@ mod tests {
                          packed {expected} vs krl {actual}"
                     );
                 }
+                // `distance(id)` walks the scalar path; `distance_all(0)` is the
+                // batch kernel, which is the one the layout switch selects.
+                let expected_all = packed_calc.distance_all(0);
+                let actual_all = krl_calc.distance_all(0);
+                assert_eq!(
+                    expected_all.len(),
+                    actual_all.len(),
+                    "dim={dim} rows={num_rows} {approx_mode:?}: batch length diverged"
+                );
+                for (id, (expected, actual)) in
+                    expected_all.iter().zip(actual_all.iter()).enumerate()
+                {
+                    assert!(
+                        (expected - actual).abs() <= 1e-3 * expected.abs().max(1.0),
+                        "dim={dim} rows={num_rows} {approx_mode:?} id={id}: batch kernel \
+                         packed {expected} vs krl {actual}"
+                    );
+                }
             }
         }
     }
