@@ -4018,6 +4018,171 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    /// The direct path must serve scattered takes, cross-page ranges and a
+    /// full range byte-for-byte identically to the decoder, and must decline
+    /// for a projection containing a nullable column.
+    #[tokio::test]
+    async fn test_fixed_width_direct_read_matches_decoder() {
+        use std::sync::atomic::Ordering;
+
+        use arrow_schema::Field as ArrowField;
+        use lance_encoding::constants::{
+            STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        };
+
+        use crate::reader::fixed_width_direct::DIRECT_READS;
+        use lance_io::ReadBatchParams;
+
+        let fs = FsFixture::default();
+        let dim = 64;
+        let fsl_type = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, false)),
+            dim,
+        );
+        let fullzip = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
+        let reader = gen_batch()
+            .col(
+                "vec",
+                array::rand_type(&fsl_type).with_metadata(fullzip.clone()),
+            )
+            .col(
+                "id",
+                array::step::<Int32Type>().with_metadata(fullzip.clone()),
+            )
+            .col(
+                "vec_nullable",
+                array::rand_type(&fsl_type)
+                    .with_random_nulls(0.2)
+                    .with_metadata(fullzip),
+            )
+            .into_reader_rows(RowCount::from(500), BatchCount::from(6));
+        let written = write_lance_file(
+            reader,
+            &fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions {
+                // Small pages so takes span several of them
+                data_cache_bytes: Some(64 * 1024),
+                max_page_bytes: Some(64 * 1024),
+                ..Default::default()
+            },
+        )
+        .await;
+        let total_rows = written.data.iter().map(|b| b.num_rows()).sum::<usize>();
+        assert_eq!(total_rows, 3000);
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vec_pages = file_reader.metadata().column_infos[0].page_infos.len();
+        assert!(vec_pages > 3, "expected several pages, got {vec_pages}");
+
+        let read = |params: ReadBatchParams, columns: &'static [&'static str], batch_size: u32| {
+            let file_reader = file_reader.clone();
+            let schema = written.schema.clone();
+            async move {
+                let projection = versions::reader_projection_from_column_names(
+                    ConcreteFileVersion::V2_1,
+                    &schema,
+                    columns,
+                )
+                .unwrap();
+                file_reader
+                    .read_stream_projected(
+                        params,
+                        batch_size,
+                        4,
+                        projection,
+                        FilterExpression::no_filter(),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let expected = |indices: &[u32], columns: &[&str]| {
+            let all = arrow_select::concat::concat_batches(
+                &written.data[0].schema(),
+                written.data.iter(),
+            )
+            .unwrap();
+            let all = all
+                .project_by_schema(&ArrowSchema::from(
+                    &written.schema.project(columns).unwrap(),
+                ))
+                .unwrap();
+            arrow_select::take::take_record_batch(&all, &UInt32Array::from(indices.to_vec()))
+                .unwrap()
+        };
+
+        // Scattered take across pages, including consecutive runs
+        let indices: Vec<u32> = vec![0, 1, 2, 17, 499, 500, 501, 1234, 2999];
+        let before = DIRECT_READS.load(Ordering::Relaxed);
+        let batches = read(
+            ReadBatchParams::Indices(UInt32Array::from(indices.clone())),
+            &["vec", "id"],
+            1024,
+        )
+        .await;
+        assert_eq!(DIRECT_READS.load(Ordering::Relaxed), before + 1);
+        let actual = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, expected(&indices, &["vec", "id"]));
+
+        // Ranges spanning page boundaries, small batch size so the read is
+        // split into several tasks
+        let before = DIRECT_READS.load(Ordering::Relaxed);
+        let batches = read(
+            ReadBatchParams::Ranges(Arc::from([490..520u64, 2990..3000u64])),
+            &["vec"],
+            16,
+        )
+        .await;
+        assert_eq!(DIRECT_READS.load(Ordering::Relaxed), before + 1);
+        assert!(batches.len() >= 3);
+        assert!(batches.iter().all(|b| b.num_rows() <= 16));
+        let actual = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let range_indices: Vec<u32> = (490..520).chain(2990..3000).collect();
+        assert_eq!(actual, expected(&range_indices, &["vec"]));
+
+        // A nullable column disqualifies the direct path; the general path
+        // still returns the right rows
+        let before = DIRECT_READS.load(Ordering::Relaxed);
+        let batches = read(
+            ReadBatchParams::Indices(UInt32Array::from(indices.clone())),
+            &["vec_nullable", "vec"],
+            1024,
+        )
+        .await;
+        assert_eq!(DIRECT_READS.load(Ordering::Relaxed), before);
+        let actual = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, expected(&indices, &["vec_nullable", "vec"]));
+
+        // Full range of this small file is under the size limit and still
+        // goes through the direct path
+        let before = DIRECT_READS.load(Ordering::Relaxed);
+        let batches = read(ReadBatchParams::RangeFull, &["id"], 1024).await;
+        assert_eq!(DIRECT_READS.load(Ordering::Relaxed), before + 1);
+        let actual = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let all: Vec<u32> = (0..3000).collect();
+        assert_eq!(actual, expected(&all, &["id"]));
+    }
+
     #[tokio::test]
     async fn test_lazy_reader_loads_only_requested_column_metadata() {
         let fs = FsFixture::default();
