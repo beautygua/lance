@@ -217,4 +217,6 @@ message RabitPartitionHeader {
   optional bytes fast_rotation_signs = 5;
   // Estimator the RabitQ storage uses at query time (residual vs raw query).
   RabitQueryEstimator query_estimator = 6;
+  // Codes are stored in the KRL adjacent-byte layout rather than packed.
+  bool krl_layout = 7;
 }

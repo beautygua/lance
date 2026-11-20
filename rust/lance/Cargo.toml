@@ -177,6 +177,8 @@ huggingface = ["lance-io/huggingface"]
 # Publish object store metrics via the `metrics` crate.
 metrics = ["lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
+# Write and scan RQ codes in the KRL adjacent-byte layout (aarch64 NEON).
+neon-dist-table-krl = ["lance-index/neon-dist-table-krl"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
 # Compile the RocksDB comparison arm of the (disabled) mem_wal_kv_point_lookup

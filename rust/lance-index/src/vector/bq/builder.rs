@@ -549,6 +549,7 @@ impl RabitQuantizer {
                     code_dim: code_dim as u32,
                     num_bits,
                     packed: false,
+                    krl_layout: false,
                     query_estimator: RabitQueryEstimator::RawQuery,
                 }
             }
@@ -560,6 +561,7 @@ impl RabitQuantizer {
                 code_dim: code_dim as u32,
                 num_bits,
                 packed: false,
+                krl_layout: false,
                 query_estimator: RabitQueryEstimator::RawQuery,
             },
         };
@@ -1109,7 +1111,14 @@ impl Quantization for RabitQuantizer {
         args: Option<crate::vector::quantizer::QuantizationMetadata>,
     ) -> Self::Metadata {
         let mut metadata = self.metadata.clone();
-        metadata.packed = args.map(|args| args.transposed).unwrap_or_default();
+        metadata.packed = args
+            .as_ref()
+            .map(|args| args.transposed)
+            .unwrap_or_default();
+        metadata.krl_layout = args
+            .as_ref()
+            .map(|args| args.krl_layout)
+            .unwrap_or_default();
         metadata
     }
 

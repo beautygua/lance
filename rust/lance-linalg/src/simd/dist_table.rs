@@ -188,6 +188,71 @@ pub unsafe fn sum_4bit_dist_table_uninit(
     }
 }
 
+/// [`sum_4bit_dist_table_uninit`] for codes whose layout the caller knows.
+///
+/// One binary can hold partitions in either layout: an index built with the
+/// KRL layout stores adjacent-byte codes, while an older one stores packed
+/// bytes. Scanning packed bytes with the KRL kernel (or the reverse) still
+/// computes the right distances but pays for the wrong shuffles, so the layout
+/// selects the kernel at runtime.
+#[inline]
+pub fn sum_4bit_dist_table_uninit_for_layout(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [MaybeUninit<u16>],
+    codes_are_krl: bool,
+) {
+    #[cfg(all(target_arch = "aarch64", feature = "neon-dist-table-krl"))]
+    {
+        use std::sync::OnceLock;
+        type Kernel = fn(&[u8], &[u8], usize, &mut [MaybeUninit<u16>]);
+        // Both kernels are compiled in; pick per call from the data layout.
+        static KRL: OnceLock<Kernel> = OnceLock::new();
+        static PACKED: OnceLock<Kernel> = OnceLock::new();
+        let kernel = if codes_are_krl {
+            KRL.get_or_init(|| sum_neon_rows::<true>)
+        } else {
+            PACKED.get_or_init(|| sum_neon_rows::<false>)
+        };
+        debug_assert!(n.is_multiple_of(BATCH_SIZE));
+        debug_assert!(dists.len() >= n);
+        debug_assert!(codes.len() >= n * code_len);
+        debug_assert!(dist_table.len() >= BATCH_SIZE * code_len);
+        kernel(codes, dist_table, code_len, &mut dists[..n]);
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon-dist-table-krl")))]
+    {
+        let _ = codes_are_krl;
+        unsafe { sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists) };
+    }
+}
+
+/// Run the NEON row-major kernel over `dists`, one 32-vector batch at a time.
+#[cfg(all(target_arch = "aarch64", feature = "neon-dist-table-krl"))]
+#[inline(always)]
+fn sum_neon_rows<const KRL: bool>(
+    codes: &[u8],
+    dist_table: &[u8],
+    code_len: usize,
+    dists: &mut [MaybeUninit<u16>],
+) {
+    let n = dists.len();
+    for i in (0..n).step_by(BATCH_SIZE) {
+        let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
+        let batch_dists = &mut dists[i..i + BATCH_SIZE];
+        // The caller asserted the bounds that cover every load of the batch.
+        unsafe {
+            if KRL {
+                sum_dist_table_32bytes_batch_neon_krl(batch_codes, dist_table, batch_dists);
+            } else {
+                sum_dist_table_32bytes_batch_neon(batch_codes, dist_table, batch_dists);
+            }
+        }
+    }
+}
+
 #[inline]
 #[allow(unused)]
 pub fn sum_4bit_dist_table_scalar(
@@ -783,6 +848,87 @@ unsafe fn sum_dist_table_32bytes_batch_neon(
     let dis1_odd = vaddq_u16(accu3_lo, accu3_hi);
     vst1q_u16(dists.as_mut_ptr().add(16).cast::<u16>(), dis1_even);
     vst1q_u16(dists.as_mut_ptr().add(24).cast::<u16>(), dis1_odd);
+}
+
+/// KRL fast-scan: `vsli`/`vsri`, 32-byte `tbl`, `vpadal`.
+///
+/// Adds adjacent code bytes. Byte `2k` must be one subquantizer and byte
+/// `2k+1` the next, for the same vectors. Lance `pack_codes` keeps those two
+/// subquantizers in separate 16-byte halves, so this kernel matches the scalar
+/// distances only once the codes have been rewritten into the KRL layout.
+#[cfg(all(target_arch = "aarch64", feature = "neon-dist-table-krl"))]
+#[inline(always)]
+unsafe fn sum_dist_table_32bytes_batch_neon_krl(
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [MaybeUninit<u16>],
+) {
+    let mut acc0 = vdupq_n_u16(0);
+    let mut acc1 = vdupq_n_u16(0);
+    let mut acc2 = vdupq_n_u16(0);
+    let mut acc3 = vdupq_n_u16(0);
+    let dist_ptr = dists.as_mut_ptr().cast::<u16>();
+
+    // Each step below consumes 32 code bytes. `code_len == 0` still has to
+    // initialize the 32 outputs.
+    let blocks = codes.len() / 32;
+    if blocks == 0 {
+        vst1q_u16(dist_ptr, acc0);
+        vst1q_u16(dist_ptr.add(8), acc1);
+        vst1q_u16(dist_ptr.add(16), acc2);
+        vst1q_u16(dist_ptr.add(24), acc3);
+        return;
+    }
+
+    // `0x1100` as bytes is `00 11 00 11 ...`. Shifted into the high nibble, odd
+    // bytes address the second 16-byte table of a `tbl` pair.
+    let bias = vreinterpretq_u8_u16(vdupq_n_u16(0x1100));
+    let mut codes_ptr = codes.as_ptr();
+    let mut lut_ptr = dist_table.as_ptr();
+
+    let mut mask0 = vld1q_u8(codes_ptr);
+    let mut mask1 = vld1q_u8(codes_ptr.add(16));
+    codes_ptr = codes_ptr.add(32);
+    let mut tables = vld1q_u8_x2(lut_ptr);
+    lut_ptr = lut_ptr.add(32);
+
+    for _ in 1..blocks {
+        let mask0_lo = vsliq_n_u8::<4>(mask0, bias);
+        let mask0_hi = vsriq_n_u8::<4>(bias, mask0);
+        mask0 = vld1q_u8(codes_ptr);
+        let mask1_lo = vsliq_n_u8::<4>(mask1, bias);
+        let mask1_hi = vsriq_n_u8::<4>(bias, mask1);
+        mask1 = vld1q_u8(codes_ptr.add(16));
+        codes_ptr = codes_ptr.add(32);
+
+        let looked0 = vqtbl2q_u8(tables, mask0_lo);
+        let looked1 = vqtbl2q_u8(tables, mask0_hi);
+        let looked2 = vqtbl2q_u8(tables, mask1_lo);
+        let looked3 = vqtbl2q_u8(tables, mask1_hi);
+
+        tables = vld1q_u8_x2(lut_ptr);
+        lut_ptr = lut_ptr.add(32);
+
+        acc0 = vpadalq_u8(acc0, looked0);
+        acc1 = vpadalq_u8(acc1, looked1);
+        acc2 = vpadalq_u8(acc2, looked2);
+        acc3 = vpadalq_u8(acc3, looked3);
+    }
+
+    let mask0_lo = vsliq_n_u8::<4>(mask0, bias);
+    let mask0_hi = vsriq_n_u8::<4>(bias, mask0);
+    let mask1_lo = vsliq_n_u8::<4>(mask1, bias);
+    let mask1_hi = vsriq_n_u8::<4>(bias, mask1);
+
+    acc0 = vpadalq_u8(acc0, vqtbl2q_u8(tables, mask0_lo));
+    acc1 = vpadalq_u8(acc1, vqtbl2q_u8(tables, mask0_hi));
+    acc2 = vpadalq_u8(acc2, vqtbl2q_u8(tables, mask1_lo));
+    acc3 = vpadalq_u8(acc3, vqtbl2q_u8(tables, mask1_hi));
+
+    vst1q_u16(dist_ptr, acc0);
+    vst1q_u16(dist_ptr.add(8), acc1);
+    vst1q_u16(dist_ptr.add(16), acc2);
+    vst1q_u16(dist_ptr.add(24), acc3);
 }
 
 /// Sum a quantized 4-bit PQ distance table over column-major codes.

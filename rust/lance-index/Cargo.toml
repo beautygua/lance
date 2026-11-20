@@ -106,6 +106,10 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 # Exposes `scalar::inverted::oracle`, the brute-force scoring reference, to
 # downstream test and bench targets. Enable it as a dev-dependency feature only.
 test-oracle = []
+# In-memory KRL adjacent-byte layout for the NEON fast-scan. Disk bytes stay in
+# `pack_codes` order unless the index was built with the layout. Also selects
+# that kernel inside lance-linalg.
+neon-dist-table-krl = ["lance-linalg/neon-dist-table-krl"]
 
 [build-dependencies]
 prost-build.workspace = true

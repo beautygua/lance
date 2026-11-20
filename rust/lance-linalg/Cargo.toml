@@ -35,6 +35,9 @@ cc = "1.0.83"
 # This requires GCC 12 / Clang 6 or later. (To get AVX-512 support,
 # you need Clang 11 or later.)
 fp16kernels = []
+# Compile the KRL adjacent-byte `dist_table` kernel and let callers select it
+# per call. Without it every scan uses the packed kernel.
+neon-dist-table-krl = []
 
 [[bench]]
 name = "l2"
