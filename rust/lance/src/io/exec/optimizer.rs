@@ -3,7 +3,7 @@
 
 //! Lance Physical Optimizer Rules
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::TakeExec;
 use super::filtered_read::FilteredReadExec;
@@ -11,13 +11,35 @@ use arrow_schema::Schema as ArrowSchema;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
+    common::{
+        stats::Precision,
+        tree_node::{Transformed, TreeNode},
+    },
     config::ConfigOptions,
     error::Result as DFResult,
-    physical_optimizer::{PhysicalOptimizerRule, optimizer::PhysicalOptimizer},
-    physical_plan::{ExecutionPlan, projection::ProjectionExec},
+    physical_optimizer::{
+        PhysicalOptimizerRule, enforce_distribution::EnforceDistribution,
+        limit_pushdown::LimitPushdown, optimizer::PhysicalOptimizer,
+        output_requirements::OutputRequirementExec,
+    },
+    physical_plan::{
+        ExecutionPlan, ExecutionPlanProperties,
+        aggregates::AggregateExec,
+        coalesce_partitions::CoalescePartitionsExec,
+        joins::{
+            CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec,
+            SymmetricHashJoinExec,
+        },
+        limit::{GlobalLimitExec, LocalLimitExec},
+        projection::ProjectionExec,
+        repartition::RepartitionExec,
+        sorts::sort_preserving_merge::SortPreservingMergeExec,
+        union::{InterleaveExec, UnionExec},
+        windows::{BoundedWindowAggExec, WindowAggExec},
+    },
 };
-use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
+use datafusion_physical_expr::{Distribution, PhysicalExpr, expressions::Column};
+use lance_core::utils::parse::str_is_truthy;
 
 /// Rule that eliminates take nodes that are immediately followed by another
 /// take node, fetching the union of the columns in a single node instead.
@@ -203,6 +225,209 @@ impl PhysicalOptimizerRule for SimplifyProjection {
     }
 }
 
+/// Environment variable that makes the generic DataFusion rules
+/// (`LimitPushdown`, `EnforceDistribution`) run on every plan, including
+/// plans they provably cannot change (the pre-N20 behaviour), for A/B
+/// measurement.
+pub const PHYSICAL_OPTIMIZER_ALWAYS_RUN_ENV: &str = "LANCE_PHYSICAL_OPTIMIZER_ALWAYS_RUN";
+
+static PHYSICAL_OPTIMIZER_ALWAYS_RUN: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var(PHYSICAL_OPTIMIZER_ALWAYS_RUN_ENV)
+        .map(|v| str_is_truthy(&v))
+        .unwrap_or(false)
+});
+
+/// Whether DataFusion's `EnforceDistribution` could change `plan`.
+///
+/// The rule rebuilds every node of the tree (bottom-up `with_new_children`)
+/// even when it inserts nothing, which on a small single-partition plan
+/// such as a vector search costs more than the rest of planning.  This
+/// mirrors the rule's own decisions: it only ever inserts or rewrites
+/// nodes when a node needs special handling (joins, aggregates, windows,
+/// unions, exchange nodes), when some node produces more than one
+/// partition (merges), when a child must be hash partitioned, when a
+/// round-robin repartition would be beneficial (a child that benefits
+/// from partitioning whose row count is unknown or exceeds a batch), when
+/// a source can be repartitioned, or when a node requires an input
+/// ordering (sort insertion).  Anything else is returned unchanged in
+/// substance, so the rule can be skipped.
+pub fn enforce_distribution_may_change(
+    plan: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> bool {
+    let node = plan.as_ref();
+    if node.is::<RepartitionExec>()
+        || node.is::<CoalescePartitionsExec>()
+        || node.is::<SortPreservingMergeExec>()
+        || node.is::<WindowAggExec>()
+        || node.is::<BoundedWindowAggExec>()
+        || node.is::<HashJoinExec>()
+        || node.is::<SortMergeJoinExec>()
+        || node.is::<CrossJoinExec>()
+        || node.is::<NestedLoopJoinExec>()
+        || node.is::<SymmetricHashJoinExec>()
+        || node.is::<AggregateExec>()
+        || node.is::<UnionExec>()
+        || node.is::<InterleaveExec>()
+        || node.is::<OutputRequirementExec>()
+    {
+        return true;
+    }
+    if plan.output_partitioning().partition_count() != 1 {
+        return true;
+    }
+    let children = plan.children();
+    if children.is_empty() {
+        return false;
+    }
+    if plan
+        .required_input_ordering()
+        .iter()
+        .any(|ordering| ordering.is_some())
+    {
+        return true;
+    }
+    let target_partitions = config.execution.target_partitions;
+    let batch_size = config.execution.batch_size;
+    let should_use_estimates = config
+        .execution
+        .use_row_number_estimates_to_optimize_partitioning;
+    let requirements = plan.required_input_distribution();
+    let beneficial = plan.benefits_from_input_partitioning();
+    if requirements.len() != children.len() || beneficial.len() != children.len() {
+        return true;
+    }
+    for ((child, requirement), roundrobin_beneficial) in
+        children.iter().zip(requirements).zip(beneficial)
+    {
+        if matches!(requirement, Distribution::HashPartitioned(_)) {
+            return true;
+        }
+        let roundrobin_beneficial_stats = match child.partition_statistics(None) {
+            Ok(stats) => match stats.num_rows {
+                Precision::Exact(n_rows) => n_rows > batch_size,
+                Precision::Inexact(n_rows) => !should_use_estimates || (n_rows > batch_size),
+                Precision::Absent => true,
+            },
+            Err(_) => true,
+        };
+        if roundrobin_beneficial_stats {
+            if config.optimizer.enable_round_robin_repartition
+                && roundrobin_beneficial
+                && child.output_partitioning().partition_count() < target_partitions
+            {
+                return true;
+            }
+            if config.optimizer.repartition_file_scans
+                && !matches!(child.repartitioned(target_partitions, config), Ok(None))
+            {
+                return true;
+            }
+        }
+        if enforce_distribution_may_change(child, config) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether DataFusion's `LimitPushdown` could change `plan`.
+///
+/// The rule only acts on limit nodes, and on a fetch that it can carry
+/// downward through nodes that support limit pushdown.  A node that has a
+/// fetch but does not support pushdown is re-created with the same fetch
+/// and the walk continues below it with no limit to push, so it does not
+/// change the plan in substance.
+pub fn limit_pushdown_may_change(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let node = plan.as_ref();
+    if node.is::<GlobalLimitExec>() || node.is::<LocalLimitExec>() {
+        return true;
+    }
+    if plan.fetch().is_some() && plan.supports_limit_pushdown() {
+        return true;
+    }
+    plan.children().into_iter().any(limit_pushdown_may_change)
+}
+
+/// Test-only guard: a skipped rule must really have been a no-op.  Every
+/// plan built by the test suite that takes the skip path is run through
+/// the real rule and its rendering compared, so the predicates above are
+/// checked against DataFusion's actual behaviour rather than trusted.
+#[cfg(test)]
+fn assert_rule_is_noop(
+    rule: &dyn PhysicalOptimizerRule,
+    plan: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> DFResult<()> {
+    use datafusion::physical_plan::displayable;
+    let before = displayable(plan.as_ref()).indent(true).to_string();
+    let after = rule.optimize(Arc::clone(plan), config)?;
+    let after = displayable(after.as_ref()).indent(true).to_string();
+    assert_eq!(
+        before,
+        after,
+        "{} was skipped but would have changed the plan",
+        rule.name()
+    );
+    Ok(())
+}
+
+/// `LimitPushdown`, skipped when it cannot change the plan
+#[derive(Debug)]
+pub struct LimitPushdownIfNeeded(LimitPushdown);
+
+impl PhysicalOptimizerRule for LimitPushdownIfNeeded {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if *PHYSICAL_OPTIMIZER_ALWAYS_RUN || limit_pushdown_may_change(&plan) {
+            self.0.optimize(plan, config)
+        } else {
+            #[cfg(test)]
+            assert_rule_is_noop(&self.0, &plan, config)?;
+            Ok(plan)
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn schema_check(&self) -> bool {
+        self.0.schema_check()
+    }
+}
+
+/// `EnforceDistribution`, skipped when it cannot change the plan
+#[derive(Debug)]
+pub struct EnforceDistributionIfNeeded(EnforceDistribution);
+
+impl PhysicalOptimizerRule for EnforceDistributionIfNeeded {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if *PHYSICAL_OPTIMIZER_ALWAYS_RUN || enforce_distribution_may_change(&plan, config) {
+            self.0.optimize(plan, config)
+        } else {
+            #[cfg(test)]
+            assert_rule_is_noop(&self.0, &plan, config)?;
+            Ok(plan)
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn schema_check(&self) -> bool {
+        self.0.schema_check()
+    }
+}
+
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
         // Rewrite `COUNT(*)`-style aggregates into CountFromMaskExec so they
@@ -212,10 +437,10 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
         Arc::new(crate::io::exec::optimizer::CoalesceTake),
         Arc::new(crate::io::exec::optimizer::SimplifyProjection),
         // Push down limit into FilteredReadExec and other Execs via with_fetch()
-        Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
+        Arc::new(LimitPushdownIfNeeded(LimitPushdown::new())),
         // Insert exchange nodes (RepartitionExec, CoalescePartitionsExec) where needed
         // to satisfy distribution requirements as exec nodes migrate to multi-partition output.
-        Arc::new(datafusion::physical_optimizer::enforce_distribution::EnforceDistribution::new()),
+        Arc::new(EnforceDistributionIfNeeded(EnforceDistribution::new())),
     ])
 }
 

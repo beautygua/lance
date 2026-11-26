@@ -281,6 +281,17 @@ impl ContextProvider for LanceContextProvider {
 /// context provider (the pre-N16 behaviour), for A/B measurement.
 pub const PLANNER_PROVIDER_UNCACHED_ENV: &str = "LANCE_PLANNER_PROVIDER_UNCACHED";
 
+/// Environment variable that disables the quoted-identifier fast path in
+/// [`Planner::parse_expr`] (every expression then goes through the SQL
+/// parser, the pre-N20 behaviour), for A/B measurement.
+pub const PARSE_EXPR_NO_FAST_PATH_ENV: &str = "LANCE_PARSE_EXPR_NO_FAST_PATH";
+
+static PARSE_EXPR_NO_FAST_PATH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var(PARSE_EXPR_NO_FAST_PATH_ENV)
+        .map(|v| lance_core::utils::parse::str_is_truthy(&v))
+        .unwrap_or(false)
+});
+
 /// The context provider is a snapshot of the default session (UDF tables,
 /// expr planners, config) and does not depend on the schema being planned,
 /// so one instance is shared by every `Planner` instead of re-snapshotting
@@ -322,6 +333,28 @@ impl Planner {
     pub fn with_enable_relations(mut self, enable_relations: bool) -> Self {
         self.enable_relations = enable_relations;
         self
+    }
+
+    /// The unescaped name when `expr` is exactly one backtick-quoted
+    /// identifier (`` `name` ``, with `` `` `` escaping a backtick), and
+    /// nothing else: no dots outside the quotes, no surrounding whitespace.
+    fn single_quoted_identifier(expr: &str) -> Option<String> {
+        let inner = expr.strip_prefix('`')?.strip_suffix('`')?;
+        let mut name = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '`' {
+                // Only an escaped (doubled) backtick may appear inside
+                if chars.next() != Some('`') {
+                    return None;
+                }
+            }
+            name.push(ch);
+        }
+        if name.is_empty() {
+            return None;
+        }
+        Some(name)
     }
 
     /// Resolve a column name using case-insensitive matching against the schema.
@@ -1010,6 +1043,17 @@ impl Planner {
         if let Ok(path) = parse_field_path(expr)
             && let [name] = path.as_slice()
             && self.schema.field_with_name(name).is_ok()
+        {
+            return Ok(Expr::Column(Column::from_name(name)));
+        }
+
+        // A single backtick-quoted identifier naming a top-level column (the
+        // form `Scanner::project` produces for every requested column) parses
+        // to exactly `Column::from_name(<unquoted name>)`, so resolve it
+        // without tokenizing and parsing a SQL statement.
+        if !*PARSE_EXPR_NO_FAST_PATH
+            && let Some(name) = Self::single_quoted_identifier(expr)
+            && self.schema.field_with_name(&name).is_ok()
         {
             return Ok(Expr::Column(Column::from_name(name)));
         }
