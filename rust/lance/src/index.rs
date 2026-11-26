@@ -1797,6 +1797,217 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
     }
 }
 
+/// Cache of live indices reconstructed from an [`IvfStateEntryBox`].
+///
+/// `open_vector_index` is called more than once per query (once to rank
+/// partitions, once for the exact search), and each call rebuilt the index
+/// from the cached state: new scan schedulers, new IO loop tasks and a fresh
+/// `openat` on the index file.  The reconstruction depends only on the state
+/// entry, the object store, the session, the dataset URI, the column and the
+/// frag-reuse remapping, none of which change between the two calls, so the
+/// result is cached and the second call becomes a hash lookup.
+///
+/// This is deliberately separate from the session index cache: that one holds
+/// portable data and its entry count is asserted by tests (credential
+/// rotation must not add entries), while this one holds process-local handles
+/// bound to an object store.
+pub(crate) mod reconstructed_index_cache {
+    use std::any::Any;
+    use std::sync::{Arc, LazyLock, Weak};
+    use std::time::Duration;
+
+    use lance_core::utils::parse::parse_env_as_bool;
+    use lance_index::vector::VectorIndex;
+    use lance_io::object_store::ObjectStore;
+    use uuid::Uuid;
+
+    use super::frag_reuse::ResolvedRemapping;
+    use super::vector::ivf::v2::IvfStateEntryBox;
+    use crate::Dataset;
+    use crate::session::Session;
+
+    /// Environment variable that disables this cache, so every open rebuilds
+    /// the live index from the cached state (the pre-N19 behaviour), for A/B
+    /// measurement.
+    pub const REBUILD_PER_OPEN_ENV: &str = "LANCE_VECTOR_INDEX_REBUILD_PER_OPEN";
+
+    static DISABLED: LazyLock<bool> =
+        LazyLock::new(|| parse_env_as_bool(REBUILD_PER_OPEN_ENV, false));
+
+    /// How long an unused live index stays cached
+    const IDLE_TTL: Duration = Duration::from_secs(60);
+    /// Upper bound on cached live indices
+    const MAX_ENTRIES: u64 = 256;
+
+    /// Identity of the remapping an index was reconstructed with.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum RemappingKey {
+        None,
+        /// Pointer to the compact v0 remapper; validity is checked with the
+        /// weak reference in [`Entry`].
+        V0(usize),
+        Identity,
+        Translate([u8; 32]),
+    }
+
+    impl RemappingKey {
+        fn of(remapping: Option<&ResolvedRemapping>) -> Self {
+            match remapping {
+                None => Self::None,
+                Some(ResolvedRemapping::V0(remapper)) => {
+                    Self::V0(Arc::as_ptr(remapper) as *const () as usize)
+                }
+                Some(ResolvedRemapping::V1Identity) => Self::Identity,
+                Some(ResolvedRemapping::V1Translate { fingerprint, .. }) => {
+                    Self::Translate(*fingerprint)
+                }
+            }
+        }
+    }
+
+    /// Identity of everything a reconstruction depends on.  Pointers are
+    /// only used to partition the key space; validity is established by the
+    /// weak references in [`Entry`].
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub(super) struct Key {
+        store: usize,
+        session: usize,
+        uri: String,
+        state: usize,
+        remapping: RemappingKey,
+        uuid: Uuid,
+        fri_uuid: Option<Uuid>,
+        column: String,
+    }
+
+    impl Key {
+        /// `state` is the cached entry the index was reconstructed from: an
+        /// `IvfStateEntryBox`, or the `PreTransformIndexState` wrapping one.
+        pub(super) fn new<T: Any + Send + Sync>(
+            dataset: &Dataset,
+            store: &Arc<ObjectStore>,
+            state: &Arc<T>,
+            remapping: Option<&ResolvedRemapping>,
+            uuid: &Uuid,
+            fri_uuid: Option<&Uuid>,
+            column: &str,
+        ) -> Self {
+            Self {
+                store: Arc::as_ptr(store) as usize,
+                session: Arc::as_ptr(&dataset.session) as usize,
+                uri: dataset.uri().to_string(),
+                state: Arc::as_ptr(state) as *const () as usize,
+                remapping: RemappingKey::of(remapping),
+                uuid: *uuid,
+                fri_uuid: fri_uuid.copied(),
+                column: column.to_string(),
+            }
+        }
+    }
+
+    struct Entry {
+        index: Arc<dyn VectorIndex>,
+        store: Weak<ObjectStore>,
+        session: Weak<Session>,
+        state: Weak<dyn Any + Send + Sync>,
+        /// The compact v0 remapper, when one was used
+        remapper: Option<Weak<dyn lance_index::scalar::RowIdRemapper>>,
+    }
+
+    impl Entry {
+        /// Whether every input the index was built from is still the very
+        /// object the caller holds now
+        fn matches<T: Any + Send + Sync>(
+            &self,
+            store: &Arc<ObjectStore>,
+            session: &Arc<Session>,
+            state: &Arc<T>,
+            remapping: Option<&ResolvedRemapping>,
+        ) -> bool {
+            fn same<T: ?Sized>(weak: &Weak<T>, current: &Arc<T>) -> bool {
+                weak.upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, current))
+            }
+            let state_matches = self
+                .state
+                .upgrade()
+                .is_some_and(|held| Arc::as_ptr(&held) as *const () as usize
+                    == Arc::as_ptr(state) as *const () as usize);
+            let remapper_matches = match (&self.remapper, remapping) {
+                (None, None) => true,
+                (None, Some(ResolvedRemapping::V1Identity))
+                | (None, Some(ResolvedRemapping::V1Translate { .. })) => true,
+                (Some(held), Some(ResolvedRemapping::V0(current))) => same(held, current),
+                _ => false,
+            };
+            same(&self.store, store)
+                && same(&self.session, session)
+                && state_matches
+                && remapper_matches
+        }
+    }
+
+    static CACHE: LazyLock<moka::sync::Cache<Key, Arc<Entry>>> = LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .time_to_idle(IDLE_TTL)
+            .max_capacity(MAX_ENTRIES)
+            .build()
+    });
+
+    pub(super) fn get<T: Any + Send + Sync>(
+        key: &Key,
+        store: &Arc<ObjectStore>,
+        session: &Arc<Session>,
+        state: &Arc<T>,
+        remapping: Option<&ResolvedRemapping>,
+    ) -> Option<Arc<dyn VectorIndex>> {
+        if *DISABLED {
+            return None;
+        }
+        let entry = CACHE.get(key)?;
+        if entry.matches(store, session, state, remapping) {
+            Some(entry.index.clone())
+        } else {
+            CACHE.invalidate(key);
+            None
+        }
+    }
+
+    pub(super) fn insert<T: Any + Send + Sync>(
+        key: Key,
+        index: &Arc<dyn VectorIndex>,
+        store: &Arc<ObjectStore>,
+        session: &Arc<Session>,
+        state: &Arc<T>,
+        remapping: Option<&ResolvedRemapping>,
+    ) {
+        if *DISABLED {
+            return;
+        }
+        let remapper = match remapping {
+            Some(ResolvedRemapping::V0(remapper)) => Some(Arc::downgrade(remapper)),
+            _ => None,
+        };
+        CACHE.insert(
+            key,
+            Arc::new(Entry {
+                index: index.clone(),
+                store: Arc::downgrade(store),
+                session: Arc::downgrade(session),
+                state: Arc::downgrade(state) as Weak<dyn Any + Send + Sync>,
+                remapper,
+            }),
+        );
+    }
+
+    /// Drop every cached live index (tests)
+    #[cfg(test)]
+    pub fn clear() {
+        CACHE.invalidate_all();
+        CACHE.run_pending_tasks();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MemWalCacheKey<'a> {
     pub uuid: &'a Uuid,
@@ -4207,6 +4418,24 @@ impl Dataset {
         if let Some(entry) = pre_transform.cached_state(&self.index_cache).await? {
             log::debug!("Found PreTransformIndexState in cache uuid: {}", uuid);
             let (_, field) = resolve_index_column(self.schema(), index_meta, column)?;
+            let reconstructed_key = reconstructed_index_cache::Key::new(
+                self,
+                &object_store,
+                &entry,
+                remapping.as_ref(),
+                uuid,
+                frag_reuse_uuid.as_ref(),
+                column,
+            );
+            if let Some(index) = reconstructed_index_cache::get(
+                &reconstructed_key,
+                &object_store,
+                &self.session,
+                &entry,
+                remapping.as_ref(),
+            ) {
+                return Ok(index);
+            }
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             let index = entry
                 .inner
@@ -4218,22 +4447,58 @@ impl Dataset {
                     remapping.clone(),
                 )
                 .await?;
-            return pre_transform.attach_cached(index, &entry, &field.data_type());
+            let index = pre_transform.attach_cached(index, &entry, &field.data_type())?;
+            reconstructed_index_cache::insert(
+                reconstructed_key,
+                &index,
+                &object_store,
+                &self.session,
+                &entry,
+                remapping.as_ref(),
+            );
+            return Ok(index);
         }
         if !pre_transform.is_declared()
             && let Some(entry) = self.index_cache.get_with_key(&state_key).await
         {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
+            let reconstructed_key = reconstructed_index_cache::Key::new(
+                self,
+                &object_store,
+                &entry,
+                remapping.as_ref(),
+                uuid,
+                frag_reuse_uuid.as_ref(),
+                column,
+            );
+            if let Some(index) = reconstructed_index_cache::get(
+                &reconstructed_key,
+                &object_store,
+                &self.session,
+                &entry,
+                remapping.as_ref(),
+            ) {
+                return Ok(index);
+            }
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            return entry
+            let index = entry
                 .0
                 .reconstruct(
-                    object_store,
+                    object_store.clone(),
                     self.metadata_cache.as_ref(),
                     partition_cache,
-                    remapping,
+                    remapping.clone(),
                 )
-                .await;
+                .await?;
+            reconstructed_index_cache::insert(
+                reconstructed_key,
+                &index,
+                &object_store,
+                &self.session,
+                &entry,
+                remapping.as_ref(),
+            );
+            return Ok(index);
         }
 
         // Fallback: in-memory cache for legacy indices.
