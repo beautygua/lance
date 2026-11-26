@@ -1833,6 +1833,20 @@ impl DecodeEngine {
         read_len: u64,
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
+        // Small reads of plain fixed-width columns skip the decoder entirely
+        let direct = |ranges: &[Range<u64>]| {
+            if filter.is_noop() {
+                fixed_width_direct::try_read(
+                    &prepared,
+                    ranges,
+                    batch_size,
+                    &self.options,
+                    &self.scheduler,
+                )
+            } else {
+                Ok(None)
+            }
+        };
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > read_len || (bound == read_len && inclusive) {
                 Err(Error::invalid_input(format!(
@@ -1854,18 +1868,19 @@ impl DecodeEngine {
                         }
                     }
                 }
-                let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
+                let indices: Vec<u64> = indices.iter().map(|idx| idx.unwrap() as u64).collect();
+                if let Some(stream) = direct(&fixed_width_direct::indices_to_ranges(&indices))? {
+                    return Ok(stream);
+                }
                 self.take_rows(indices, batch_size, prepared).await
             }
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end as u64, false)?;
-                self.read_range(
-                    range.start as u64..range.end as u64,
-                    batch_size,
-                    prepared,
-                    filter,
-                )
-                .await
+                let range = range.start as u64..range.end as u64;
+                if let Some(stream) = direct(std::slice::from_ref(&range))? {
+                    return Ok(stream);
+                }
+                self.read_range(range, batch_size, prepared, filter).await
             }
             ReadBatchParams::Ranges(ranges) => {
                 let mut ranges_u64 = Vec::with_capacity(ranges.len());
@@ -1873,22 +1888,34 @@ impl DecodeEngine {
                     verify_bound(&params, range.end, false)?;
                     ranges_u64.push(range.start..range.end);
                 }
+                if let Some(stream) = direct(&ranges_u64)? {
+                    return Ok(stream);
+                }
                 self.read_ranges(ranges_u64, batch_size, prepared, filter)
                     .await
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
-                self.read_range(range.start as u64..read_len, batch_size, prepared, filter)
-                    .await
+                let range = range.start as u64..read_len;
+                if let Some(stream) = direct(std::slice::from_ref(&range))? {
+                    return Ok(stream);
+                }
+                self.read_range(range, batch_size, prepared, filter).await
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
-                self.read_range(0..range.end as u64, batch_size, prepared, filter)
-                    .await
+                let range = 0..range.end as u64;
+                if let Some(stream) = direct(std::slice::from_ref(&range))? {
+                    return Ok(stream);
+                }
+                self.read_range(range, batch_size, prepared, filter).await
             }
             ReadBatchParams::RangeFull => {
-                self.read_range(0..read_len, batch_size, prepared, filter)
-                    .await
+                let range = 0..read_len;
+                if let Some(stream) = direct(std::slice::from_ref(&range))? {
+                    return Ok(stream);
+                }
+                self.read_range(range, batch_size, prepared, filter).await
             }
         }
     }
@@ -2289,6 +2316,387 @@ impl ProjectedFileReader {
             .await?;
         self.read_prepared_tasks(params, batch_size, prepared, read_len, filter)
             .await
+    }
+}
+
+/// Direct reads of small ranges of plain fixed-width columns.
+///
+/// A take of a few dozen rows of a `FixedSizeList<f32, 960>` vector column
+/// otherwise goes through the full structural decoder: one decode task per
+/// page, a rep/def unraveler and a data-block builder, for data that is
+/// stored as one flat, uncompressed buffer per page. When every projected
+/// column qualifies, the bytes for the requested rows are at a known offset
+/// and can be fetched and assembled directly.
+mod fixed_width_direct {
+    use std::{ops::Range, sync::Arc};
+
+    use arrow_array::{ArrayRef, RecordBatch, make_array};
+    use arrow_buffer::MutableBuffer;
+    use arrow_data::ArrayData;
+    use arrow_schema::{DataType, Schema as ArrowSchema};
+    use futures::{FutureExt, StreamExt, stream::BoxStream};
+    use lance_core::utils::parse::str_is_truthy;
+    use lance_core::{Error, Result, datatypes::Field};
+    use lance_encoding::EncodingsIo;
+    use lance_encoding::decoder::{ColumnInfo, PageEncoding, ReadBatchTask};
+    use lance_encoding::format::pb as pbenc;
+    use lance_encoding::format::pb21 as pbenc21;
+
+    use super::{FileReaderOptions, PreparedProjection};
+
+    /// Environment variable that disables the direct fixed-width read and
+    /// sends every read through the general scheduler / decoder (the
+    /// pre-N23 behaviour), for A/B measurement.
+    pub const DIRECT_READ_DISABLED_ENV: &str = "LANCE_FIXED_WIDTH_DIRECT_READ_DISABLED";
+
+    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var(DIRECT_READ_DISABLED_ENV)
+            .map(|v| str_is_truthy(&v))
+            .unwrap_or(false)
+    });
+
+    /// Environment variable overriding [`DIRECT_READ_MAX_BYTES_DEFAULT`].
+    pub const DIRECT_READ_MAX_BYTES_ENV: &str = "LANCE_FIXED_WIDTH_DIRECT_READ_MAX_BYTES";
+
+    /// Largest read (summed over the projected columns) served directly.
+    ///
+    /// The direct path copies the fetched bytes on the reading task and
+    /// decodes nothing in parallel, which suits a take of a few rows but
+    /// loses to the pipelined decoder on a scan: a full scan of a 3.8 GiB
+    /// vector column measured 20% slower through it.  4 MiB covers takes
+    /// of about a thousand 960-dimensional f32 rows while leaving scans on
+    /// the general path.
+    pub const DIRECT_READ_MAX_BYTES_DEFAULT: u64 = 4 * 1024 * 1024;
+
+    static MAX_BYTES: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var(DIRECT_READ_MAX_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DIRECT_READ_MAX_BYTES_DEFAULT)
+    });
+
+    /// Number of reads served by the direct path (tests)
+    #[cfg(test)]
+    pub(super) static DIRECT_READS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// A column that qualifies for the direct read
+    struct DirectColumn {
+        data_type: DataType,
+        bytes_per_row: u64,
+        /// (first row of the page, rows in the page, file position of the
+        /// page's data buffer), in row order
+        pages: Vec<(u64, u64, u64)>,
+    }
+
+    /// Bytes per row of a fixed-width Arrow type: primitives by their
+    /// width, fixed-size lists by their item count times the child width.
+    /// `None` for anything that is not a plain fixed-width layout.  Item
+    /// nullability is not checked here: the page layout's `has_validity`
+    /// flag (see [`is_raw_values`]) decides whether items can be null.
+    fn fixed_row_width(data_type: &DataType) -> Option<u64> {
+        match data_type {
+            DataType::FixedSizeList(child, dim) if *dim > 0 => {
+                fixed_row_width(child.data_type()).map(|w| w * *dim as u64)
+            }
+            DataType::FixedSizeList(..) => None,
+            dt if dt.is_primitive() => dt.primitive_width().map(|w| w as u64),
+            _ => None,
+        }
+    }
+
+    /// Whether `compression` stores values as raw little-endian bytes:
+    /// `Flat` with no buffer compression, possibly wrapped in fixed-size
+    /// list layers without validity.
+    fn is_raw_values(compression: Option<&pbenc21::CompressiveEncoding>) -> bool {
+        use pbenc21::compressive_encoding::Compression;
+        match compression.and_then(|c| c.compression.as_ref()) {
+            Some(Compression::Flat(flat)) => flat.data.is_none(),
+            Some(Compression::FixedSizeList(fsl)) => {
+                !fsl.has_validity && is_raw_values(fsl.values.as_deref())
+            }
+            _ => false,
+        }
+    }
+
+    fn qualify(field: &Field, info: &ColumnInfo) -> Option<DirectColumn> {
+        if !field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
+            return None;
+        }
+        if !matches!(
+            info.encoding.column_encoding,
+            Some(pbenc::column_encoding::ColumnEncoding::Values(()))
+        ) {
+            return None;
+        }
+        let data_type = field.data_type();
+        let bytes_per_row = fixed_row_width(&data_type)?;
+        if info.page_infos.is_empty() {
+            return None;
+        }
+        let mut pages = Vec::with_capacity(info.page_infos.len());
+        let mut row_start = 0u64;
+        for page in info.page_infos.iter() {
+            let PageEncoding::Structural(pbenc21::PageLayout {
+                layout: Some(pbenc21::page_layout::Layout::FullZipLayout(fz)),
+            }) = &page.encoding
+            else {
+                return None;
+            };
+            let all_valid_layers = fz
+                .layers
+                .iter()
+                .all(|layer| *layer == pbenc21::RepDefLayer::RepdefAllValidItem as i32);
+            let Some(pbenc21::full_zip_layout::Details::BitsPerValue(bits)) = fz.details else {
+                return None;
+            };
+            if fz.bits_rep != 0
+                || fz.bits_def != 0
+                || !all_valid_layers
+                || bits as u64 != bytes_per_row * 8
+                || fz.num_items as u64 != page.num_rows
+                || fz.num_visible_items != fz.num_items
+                || !is_raw_values(fz.value_compression.as_ref())
+                || page.buffer_offsets_and_sizes.len() != 1
+            {
+                return None;
+            }
+            let (position, size) = page.buffer_offsets_and_sizes[0];
+            if size < page.num_rows * bytes_per_row {
+                return None;
+            }
+            pages.push((row_start, page.num_rows, position));
+            row_start += page.num_rows;
+        }
+        Some(DirectColumn {
+            data_type,
+            bytes_per_row,
+            pages,
+        })
+    }
+
+    /// Coalesce sorted-or-not row indices into row ranges (consecutive
+    /// indices merge; the order of the indices is preserved).
+    pub(super) fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
+        let mut ranges: Vec<Range<u64>> = Vec::new();
+        for &idx in indices {
+            match ranges.last_mut() {
+                Some(last) if last.end == idx => last.end += 1,
+                _ => ranges.push(idx..idx + 1),
+            }
+        }
+        ranges
+    }
+
+    /// Byte ranges covering `rows` of `column`, in row order
+    fn byte_ranges(column: &DirectColumn, rows: &[Range<u64>]) -> Vec<Range<u64>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for range in rows {
+            // First page that can contain range.start
+            let mut page_idx = column
+                .pages
+                .partition_point(|(start, rows, _)| start + rows <= range.start);
+            let mut row = range.start;
+            while row < range.end {
+                let (page_start, page_rows, position) = column.pages[page_idx];
+                let end = range.end.min(page_start + page_rows);
+                let from = position + (row - page_start) * column.bytes_per_row;
+                let to = position + (end - page_start) * column.bytes_per_row;
+                out.push(from..to);
+                row = end;
+                page_idx += 1;
+            }
+        }
+        out
+    }
+
+    fn build_array(data_type: &DataType, values: arrow_buffer::Buffer, len: usize) -> ArrayRef {
+        let data = match data_type {
+            DataType::FixedSizeList(child, dim) => {
+                let child_len = len * *dim as usize;
+                let child = build_array(child.data_type(), values, child_len);
+                ArrayData::builder(data_type.clone())
+                    .len(len)
+                    .add_child_data(child.to_data())
+            }
+            _ => ArrayData::builder(data_type.clone())
+                .len(len)
+                .add_buffer(values),
+        };
+        // Safety: the buffer is a fresh 64-byte aligned copy holding exactly
+        // `len * bytes_per_row` bytes; fixed-size lists carry no offsets
+        // or validity, so there is nothing else to validate
+        make_array(unsafe { data.build_unchecked() })
+    }
+
+    /// Read `ranges` directly when every projected column qualifies.
+    /// Returns `None` (having done no I/O) when the general path is needed.
+    pub(super) fn try_read(
+        prepared: &PreparedProjection,
+        ranges: &[Range<u64>],
+        batch_size: u32,
+        options: &FileReaderOptions,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> Result<Option<BoxStream<'static, ReadBatchTask>>> {
+        if *DISABLED || options.batch_size_bytes.is_some() || batch_size == 0 {
+            return Ok(None);
+        }
+        let projection = &prepared.decoder_projection;
+        let fields = &projection.schema.fields;
+        if fields.is_empty() || fields.len() != projection.column_indices.len() {
+            return Ok(None);
+        }
+        let mut columns = Vec::with_capacity(fields.len());
+        for (field, column_index) in fields.iter().zip(&projection.column_indices) {
+            let Some(info) = prepared.column_infos.get(*column_index as usize) else {
+                return Ok(None);
+            };
+            let Some(column) = qualify(field, info) else {
+                return Ok(None);
+            };
+            columns.push(column);
+        }
+        let ranges: Vec<Range<u64>> = ranges.iter().filter(|r| !r.is_empty()).cloned().collect();
+        let total_rows: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        if total_rows == 0 {
+            return Ok(Some(futures::stream::empty().boxed()));
+        }
+        let bytes_per_row: u64 = columns.iter().map(|c| c.bytes_per_row).sum();
+        if total_rows.saturating_mul(bytes_per_row) > *MAX_BYTES {
+            return Ok(None);
+        }
+
+        #[cfg(test)]
+        DIRECT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let arrow_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
+        let columns = Arc::new(columns);
+        let io = io.clone();
+        // Split the request into batches of `batch_size` rows, each read by
+        // one I/O request per column
+        let mut batches: Vec<Vec<Range<u64>>> = Vec::new();
+        let mut current: Vec<Range<u64>> = Vec::new();
+        let mut current_rows = 0u64;
+        for range in ranges {
+            let mut start = range.start;
+            while start < range.end {
+                let room = batch_size as u64 - current_rows;
+                let end = range.end.min(start + room);
+                current.push(start..end);
+                current_rows += end - start;
+                start = end;
+                if current_rows == batch_size as u64 {
+                    batches.push(std::mem::take(&mut current));
+                    current_rows = 0;
+                }
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+
+        let tasks = batches.into_iter().map(move |rows| {
+            let num_rows: u64 = rows.iter().map(|r| r.end - r.start).sum();
+            let priority = rows.first().map(|r| r.start).unwrap_or(0);
+            let io_futs = columns
+                .iter()
+                .map(|column| io.submit_request(byte_ranges(column, &rows), priority))
+                .collect::<Vec<_>>();
+            let columns = columns.clone();
+            let arrow_schema = arrow_schema.clone();
+            let task = async move {
+                let mut arrays = Vec::with_capacity(columns.len());
+                for (column, io_fut) in columns.iter().zip(io_futs) {
+                    let chunks = io_fut.await?;
+                    let expected = num_rows * column.bytes_per_row;
+                    let mut values = MutableBuffer::with_capacity(expected as usize);
+                    for chunk in &chunks {
+                        values.extend_from_slice(chunk.as_ref());
+                    }
+                    if values.len() as u64 != expected {
+                        return Err(Error::io(format!(
+                            "direct fixed-width read returned {} bytes, expected {}",
+                            values.len(),
+                            expected
+                        )));
+                    }
+                    arrays.push(build_array(
+                        &column.data_type,
+                        values.into(),
+                        num_rows as usize,
+                    ));
+                }
+                Ok(RecordBatch::try_new(arrow_schema, arrays)?)
+            }
+            .boxed();
+            ReadBatchTask {
+                task,
+                num_rows: num_rows as u32,
+            }
+        });
+        Ok(Some(futures::stream::iter(tasks).boxed()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_indices_to_ranges() {
+            assert_eq!(indices_to_ranges(&[]), Vec::<Range<u64>>::new());
+            assert_eq!(indices_to_ranges(&[3]), vec![3..4]);
+            assert_eq!(
+                indices_to_ranges(&[3, 4, 5, 9, 10, 20]),
+                vec![3..6, 9..11, 20..21]
+            );
+            // Order is preserved, only consecutive runs merge
+            assert_eq!(indices_to_ranges(&[5, 4, 3]), vec![5..6, 4..5, 3..4]);
+        }
+
+        #[test]
+        fn test_byte_ranges_across_pages() {
+            let column = DirectColumn {
+                data_type: DataType::Float32,
+                bytes_per_row: 4,
+                pages: vec![(0, 10, 1000), (10, 10, 5000), (20, 5, 9000)],
+            };
+            assert_eq!(byte_ranges(&column, &[0..1]), vec![1000..1004]);
+            assert_eq!(byte_ranges(&column, &[9..10]), vec![1036..1040]);
+            assert_eq!(byte_ranges(&column, &[10..11]), vec![5000..5004]);
+            // Spans two pages
+            assert_eq!(byte_ranges(&column, &[8..12]), vec![1032..1040, 5000..5008]);
+            // Spans three pages, plus a second range
+            assert_eq!(
+                byte_ranges(&column, &[9..21, 24..25]),
+                vec![1036..1040, 5000..5040, 9000..9004, 9016..9020]
+            );
+        }
+
+        #[test]
+        fn test_fixed_row_width() {
+            use arrow_schema::Field as ArrowField;
+            assert_eq!(fixed_row_width(&DataType::Float32), Some(4));
+            assert_eq!(fixed_row_width(&DataType::Int64), Some(8));
+            assert_eq!(fixed_row_width(&DataType::Boolean), None);
+            assert_eq!(fixed_row_width(&DataType::Utf8), None);
+            let fsl = DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, false)),
+                960,
+            );
+            assert_eq!(fixed_row_width(&fsl), Some(3840));
+            let nested = DataType::FixedSizeList(Arc::new(ArrowField::new("item", fsl, false)), 2);
+            assert_eq!(fixed_row_width(&nested), Some(7680));
+            let nullable_items = DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            );
+            assert_eq!(fixed_row_width(&nullable_items), Some(16));
+            let bool_items = DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Boolean, false)),
+                4,
+            );
+            assert_eq!(fixed_row_width(&bool_items), None);
+        }
     }
 }
 
