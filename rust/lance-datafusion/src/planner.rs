@@ -277,9 +277,31 @@ impl ContextProvider for LanceContextProvider {
     }
 }
 
+/// Environment variable that restores per-`Planner` construction of the
+/// context provider (the pre-N16 behaviour), for A/B measurement.
+pub const PLANNER_PROVIDER_UNCACHED_ENV: &str = "LANCE_PLANNER_PROVIDER_UNCACHED";
+
+/// The context provider is a snapshot of the default session (UDF tables,
+/// expr planners, config) and does not depend on the schema being planned,
+/// so one instance is shared by every `Planner` instead of re-snapshotting
+/// the session on each construction.
+fn shared_context_provider() -> Arc<LanceContextProvider> {
+    static SHARED: std::sync::OnceLock<Arc<LanceContextProvider>> = std::sync::OnceLock::new();
+    static UNCACHED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(PLANNER_PROVIDER_UNCACHED_ENV)
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    });
+    if *UNCACHED {
+        return Arc::new(LanceContextProvider::default());
+    }
+    SHARED
+        .get_or_init(|| Arc::new(LanceContextProvider::default()))
+        .clone()
+}
+
 pub struct Planner {
     schema: SchemaRef,
-    context_provider: LanceContextProvider,
+    context_provider: Arc<LanceContextProvider>,
     enable_relations: bool,
 }
 
@@ -287,7 +309,7 @@ impl Planner {
     pub fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
-            context_provider: LanceContextProvider::default(),
+            context_provider: shared_context_provider(),
             enable_relations: false,
         }
     }
@@ -565,7 +587,7 @@ impl Planner {
             return self.legacy_parse_function(function);
         }
         let sql_to_rel = SqlToRel::new_with_options(
-            &self.context_provider,
+            self.context_provider.as_ref(),
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
